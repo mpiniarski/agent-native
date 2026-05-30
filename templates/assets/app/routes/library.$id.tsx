@@ -6,7 +6,11 @@ import {
   useRef,
   useState,
 } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  type QueryClient,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
   ShareButton,
@@ -102,6 +106,110 @@ import {
   VIDEO_RESOLUTIONS,
 } from "../../shared/api";
 
+function candidateSaveKey(slot: any): string {
+  if (typeof slot?.assetId === "string" && slot.assetId) {
+    return `asset:${slot.assetId}`;
+  }
+  if (typeof slot?.slotId === "string" && slot.slotId) {
+    return `slot:${slot.slotId}`;
+  }
+  return "";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function markLibraryAssetSavedInCache(
+  queryClient: QueryClient,
+  libraryId: string,
+  assetId: string,
+  savedAsset: unknown,
+) {
+  const savedAssetRecord = isRecord(savedAsset) ? savedAsset : {};
+  queryClient.setQueryData(
+    ["action", "get-library", { id: libraryId }],
+    (current: any) => {
+      if (!current || !Array.isArray(current.assets)) return current;
+      let changed = false;
+      const assets = current.assets.map((asset: any) => {
+        if (asset.id !== assetId) return asset;
+        changed = true;
+        const currentMetadata = isRecord(asset.metadata) ? asset.metadata : {};
+        const savedMetadata = isRecord(savedAssetRecord.metadata)
+          ? savedAssetRecord.metadata
+          : {};
+        return {
+          ...asset,
+          ...savedAssetRecord,
+          status: "saved",
+          metadata: { ...currentMetadata, ...savedMetadata },
+        };
+      });
+      return changed ? { ...current, assets } : current;
+    },
+  );
+}
+
+function removeAssetsFromLibraryCache(
+  queryClient: QueryClient,
+  libraryId: string,
+  assetIds: Array<string | null | undefined>,
+) {
+  const ids = new Set(
+    assetIds.filter((id): id is string => typeof id === "string" && !!id),
+  );
+  if (ids.size === 0) return;
+  queryClient.setQueryData(
+    ["action", "get-library", { id: libraryId }],
+    (current: any) => {
+      if (!current || !Array.isArray(current.assets)) return current;
+      const assets = current.assets.filter((asset: any) => !ids.has(asset.id));
+      return assets.length === current.assets.length
+        ? current
+        : { ...current, assets };
+    },
+  );
+}
+
+function updateVariantSlotsInCache(
+  queryClient: QueryClient,
+  shouldRemove: (slot: any) => boolean,
+) {
+  queryClient.setQueryData(["app-state", "asset-variants"], (current: any) => {
+    if (!current || !Array.isArray(current.slots)) return current;
+    const slots = current.slots.filter((slot: any) => !shouldRemove(slot));
+    if (slots.length === current.slots.length) return current;
+    if (slots.length === 0) return null;
+    return {
+      ...current,
+      slots,
+      updatedAt: new Date().toISOString(),
+    };
+  });
+}
+
+function removeVariantSlotFromCache(queryClient: QueryClient, slot: any) {
+  const slotId = typeof slot?.slotId === "string" ? slot.slotId : null;
+  const assetId = typeof slot?.assetId === "string" ? slot.assetId : null;
+  updateVariantSlotsInCache(
+    queryClient,
+    (candidate) =>
+      (!!slotId && candidate.slotId === slotId) ||
+      (!!assetId && candidate.assetId === assetId),
+  );
+}
+
+function removeVariantSlotsByScopeFromCache(
+  queryClient: QueryClient,
+  scope: "failed" | "all",
+) {
+  updateVariantSlotsInCache(
+    queryClient,
+    (slot) => scope === "all" || slot.status === "failed",
+  );
+}
+
 export default function LibraryPage() {
   const { id } = useParams();
   const navigate = useNavigate();
@@ -137,6 +245,11 @@ export default function LibraryPage() {
   );
   const [optimisticallyDeletedAssetIds, setOptimisticallyDeletedAssetIds] =
     useState<Set<string>>(() => new Set());
+  const [optimisticallySavedAssetIds, setOptimisticallySavedAssetIds] =
+    useState<Set<string>>(() => new Set());
+  const [savingCandidateKeys, setSavingCandidateKeys] = useState<Set<string>>(
+    () => new Set(),
+  );
   const [mediaFilter, setMediaFilter] = useState<"all" | "image" | "video">(
     "all",
   );
@@ -165,9 +278,21 @@ export default function LibraryPage() {
   const generationPresets = ((presetData as any)?.presets ?? []) as any[];
   const generationSessions = ((sessionData as any)?.sessions ?? []) as any[];
   const serverAssets = (data?.assets ?? []) as any[];
-  const assets = serverAssets.filter(
-    (asset) => !optimisticallyDeletedAssetIds.has(asset.id),
+  const savedCandidateAssetIds = new Set(
+    serverAssets
+      .filter(
+        (asset) =>
+          asset.status === "saved" || optimisticallySavedAssetIds.has(asset.id),
+      )
+      .map((asset) => asset.id),
   );
+  const assets = serverAssets
+    .map((asset) =>
+      optimisticallySavedAssetIds.has(asset.id)
+        ? { ...asset, status: "saved" }
+        : asset,
+    )
+    .filter((asset) => !optimisticallyDeletedAssetIds.has(asset.id));
   const visibleAssets = assets.filter((asset) => {
     if (activeFolderId !== "all") {
       if (activeFolderId === null && asset.folderId) return false;
@@ -184,7 +309,8 @@ export default function LibraryPage() {
       asset.mimeType,
       asset.status,
       asset.role,
-      asset.metadata?.category,
+      assetCategoryLabel(asset),
+      asset.metadata?.intent,
       asset.metadata?.originalName,
     ]
       .filter((value): value is string => typeof value === "string")
@@ -208,7 +334,12 @@ export default function LibraryPage() {
   });
 
   const pendingVariants =
-    variants?.libraryId === libraryId ? (variants.slots ?? []) : [];
+    variants?.libraryId === libraryId
+      ? (variants.slots ?? []).filter(
+          (slot: any) =>
+            !slot.assetId || !savedCandidateAssetIds.has(slot.assetId),
+        )
+      : [];
 
   function markAssetsOptimisticallyDeleted(ids: string[]) {
     setOptimisticallyDeletedAssetIds((current) => {
@@ -235,6 +366,77 @@ export default function LibraryPage() {
       return next.size === current.size ? current : next;
     });
   }, [serverAssets]);
+
+  useEffect(() => {
+    setOptimisticallySavedAssetIds((current) => {
+      if (current.size === 0) return current;
+      const serverStatusById = new Map(
+        serverAssets.map((asset) => [asset.id, asset.status]),
+      );
+      const next = new Set(
+        [...current].filter((assetId) => {
+          const status = serverStatusById.get(assetId);
+          return status !== undefined && status !== "saved";
+        }),
+      );
+      return next.size === current.size ? current : next;
+    });
+  }, [serverAssets]);
+
+  function setCandidateSaving(key: string, saving: boolean) {
+    setSavingCandidateKeys((current) => {
+      const next = new Set(current);
+      if (saving) {
+        next.add(key);
+      } else {
+        next.delete(key);
+      }
+      return next.size === current.size ? current : next;
+    });
+  }
+
+  async function handleSaveCandidate(slot: any) {
+    const key = candidateSaveKey(slot);
+    if (!key || savingCandidateKeys.has(key)) return;
+
+    setCandidateSaving(key, true);
+    try {
+      const savedAsset = await saveGenerated.mutateAsync({
+        ...(slot.assetId ? { assetId: slot.assetId } : {}),
+        ...(slot.slotId ? { slotId: slot.slotId } : {}),
+      });
+      const savedAssetId =
+        typeof (savedAsset as any)?.id === "string"
+          ? (savedAsset as any).id
+          : slot.assetId;
+
+      if (savedAssetId) {
+        setOptimisticallySavedAssetIds((current) => {
+          const next = new Set(current);
+          next.add(savedAssetId);
+          return next;
+        });
+        markLibraryAssetSavedInCache(
+          queryClient,
+          libraryId,
+          savedAssetId,
+          savedAsset,
+        );
+      }
+      removeVariantSlotFromCache(queryClient, slot);
+      void queryClient.invalidateQueries({
+        queryKey: ["app-state", "asset-variants"],
+        refetchType: "active",
+      });
+      toast.success("Saved candidate.");
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : "Could not save candidate.",
+      );
+    } finally {
+      setCandidateSaving(key, false);
+    }
+  }
 
   useEffect(() => {
     const selectableAssets =
@@ -478,8 +680,31 @@ export default function LibraryPage() {
     const selectedPreset = options.presetId
       ? generationPresets.find((preset) => preset.id === options.presetId)
       : null;
+    const trimmedPrompt = prompt.trim();
+    const chatMessage =
+      trimmedPrompt ||
+      (options.mediaType === "video"
+        ? "Generate a video for this library."
+        : "Generate images for this library.");
     const context = [
       "## Assets library context",
+      options.mediaType === "video"
+        ? "Requested output: 1 video candidate for this library"
+        : `Requested output: ${options.count} image candidate${options.count === 1 ? "" : "s"} for this library`,
+      `User prompt: ${trimmedPrompt || "(no text prompt provided)"}`,
+      options.presetId ? `Preset ID: ${options.presetId}` : "Preset ID: none",
+      `Aspect ratio: ${options.aspectRatio}`,
+      options.mediaType === "video"
+        ? `Duration: ${options.durationSeconds}s\nResolution: ${options.resolution}`
+        : `Image size: ${options.imageSize}`,
+      `Model: ${options.model}`,
+      activeFolderId && activeFolderId !== "all"
+        ? `Folder ID: ${activeFolderId}`
+        : "Folder ID: none",
+      `Reference categories: ${options.category}`,
+      `Include canonical logo: ${options.includeLogo ? "yes" : "no"}`,
+      "",
+      "## Selected library",
       `Library: ${library.title} (${library.id})`,
       `Description: ${library.description || ""}`,
       `Folder: ${activeFolderId && activeFolderId !== "all" ? folders.find((folder) => folder.id === activeFolderId)?.title : "All assets"}`,
@@ -498,23 +723,7 @@ export default function LibraryPage() {
         : "Use the asset generation actions. If a generation preset ID is present, pass presetId to generate-image or generate-image-batch. Generate candidates, show previews, ask for feedback, and refine by assetId until the user is happy.",
     ].join("\n");
     sendToAgentChat({
-      message: [
-        options.mediaType === "video"
-          ? "Generate 1 video candidate for this library."
-          : `Generate ${options.count} image candidate${options.count === 1 ? "" : "s"} for this library.`,
-        `Prompt: ${prompt}`,
-        options.presetId ? `Preset ID: ${options.presetId}` : "Preset ID: none",
-        `Aspect ratio: ${options.aspectRatio}`,
-        options.mediaType === "video"
-          ? `Duration: ${options.durationSeconds}s\nResolution: ${options.resolution}`
-          : `Image size: ${options.imageSize}`,
-        `Model: ${options.model}`,
-        activeFolderId && activeFolderId !== "all"
-          ? `Folder ID: ${activeFolderId}`
-          : "Folder ID: none",
-        `Reference categories: ${options.category}`,
-        `Include canonical logo: ${options.includeLogo ? "yes" : "no"}`,
-      ].join("\n"),
+      message: chatMessage,
       context,
       submit: true,
       newTab: true,
@@ -603,7 +812,7 @@ export default function LibraryPage() {
                 "Upload, generate, describe, and organize reusable assets across agents."}
             </p>
           </div>
-          <div className="flex flex-wrap items-center gap-2">
+          <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto sm:flex-nowrap lg:shrink-0">
             <ShareButton
               resourceType="asset-library"
               resourceId={library.id}
@@ -624,7 +833,7 @@ export default function LibraryPage() {
             </Button>
             <Button
               variant="outline"
-              className="gap-2"
+              className="hidden gap-2 xl:inline-flex"
               onClick={() => setFolderOpen(true)}
             >
               <IconFolderPlus className="h-4 w-4" />
@@ -649,6 +858,17 @@ export default function LibraryPage() {
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
+                <DropdownMenuItem
+                  className="xl:hidden"
+                  onSelect={(event) => {
+                    event.preventDefault();
+                    setFolderOpen(true);
+                  }}
+                >
+                  <IconFolderPlus className="mr-2 h-4 w-4 shrink-0" />
+                  New folder
+                </DropdownMenuItem>
+                <DropdownMenuSeparator className="xl:hidden" />
                 <DropdownMenuItem
                   onSelect={(event) => {
                     event.preventDefault();
@@ -721,13 +941,6 @@ export default function LibraryPage() {
       ) : null}
 
       <div className="flex-1 overflow-y-auto px-6 py-5">
-        <BrandSummaryCard
-          library={library}
-          assets={assets}
-          referencesCount={references.length}
-          onGenerate={() => setGenerateOpen(true)}
-        />
-
         <section className="mb-5 space-y-3">
           <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
             <div className="flex min-w-0 flex-wrap items-center gap-2">
@@ -804,14 +1017,21 @@ export default function LibraryPage() {
                   These slots are written by the agent while generation runs.
                 </p>
               </div>
-              <LiveCandidatesActions slots={pendingVariants} />
+              <LiveCandidatesActions
+                slots={pendingVariants}
+                libraryId={libraryId}
+              />
             </div>
             <div className="grid grid-cols-1 gap-3 md:grid-cols-3 xl:grid-cols-4">
               {pendingVariants.map((slot: any) => (
                 <VariantCard
                   key={slot.slotId}
                   slot={slot}
-                  onSave={() => saveGenerated.mutate({ assetId: slot.assetId })}
+                  libraryId={libraryId}
+                  saving={savingCandidateKeys.has(candidateSaveKey(slot))}
+                  onSave={() => {
+                    void handleSaveCandidate(slot);
+                  }}
                 />
               ))}
             </div>
@@ -1020,135 +1240,6 @@ type PendingUpload = {
 
 type LibraryTab = "references" | "generated" | "runs" | "settings";
 
-function BrandSummaryCard({
-  library,
-  assets,
-  referencesCount,
-  onGenerate,
-}: {
-  library: any;
-  assets: any[];
-  referencesCount: number;
-  onGenerate: () => void;
-}) {
-  const style = library.styleBrief ?? {};
-  const settings = library.settings ?? {};
-  const analysis = settings.brandAnalysis ?? {};
-  const canonicalIds = Array.isArray(settings.canonicalStyleAssetIds)
-    ? settings.canonicalStyleAssetIds.filter(
-        (id: unknown): id is string => typeof id === "string",
-      )
-    : [];
-  const anchors = assets
-    .filter(
-      (asset) =>
-        asset.metadata?.isStyleAnchor === true ||
-        canonicalIds.includes(asset.id),
-    )
-    .slice(0, 4);
-  const palette = Array.isArray(style.palette) ? style.palette.slice(0, 6) : [];
-  const constraints = Array.isArray(style.doNot) ? style.doNot.slice(0, 2) : [];
-  const traits = [style.medium, style.mood, style.texture]
-    .filter((item): item is string => typeof item === "string" && !!item.trim())
-    .slice(0, 3);
-  const analyzedCount =
-    typeof analysis.analyzedImageCount === "number"
-      ? analysis.analyzedImageCount
-      : typeof analysis.referenceCount === "number"
-        ? analysis.referenceCount
-        : referencesCount;
-
-  return (
-    <section className="mb-5 rounded-lg border border-border bg-card p-4">
-      <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-        <div className="min-w-0 space-y-3">
-          <div className="flex flex-wrap items-center gap-2">
-            <h3 className="text-sm font-semibold">Brand summary</h3>
-            <Badge variant={analysis.analyzedAt ? "secondary" : "outline"}>
-              {analysis.analyzedAt ? "Learned" : "Needs analysis"}
-            </Badge>
-            <span className="text-xs text-muted-foreground">
-              {analyzedCount} reference{analyzedCount === 1 ? "" : "s"}
-              {analysis.analyzedAt
-                ? ` · Last analyzed ${formatBrandAnalysisTime(
-                    analysis.analyzedAt,
-                  )}`
-                : ""}
-            </span>
-          </div>
-          <p className="line-clamp-2 max-w-4xl text-sm leading-relaxed text-foreground">
-            {style.description ||
-              "Upload example assets, analyze the brand in Settings, then generate from a prompt with the library look applied."}
-          </p>
-          <div className="flex flex-wrap items-center gap-3">
-            {palette.length ? (
-              <div className="flex items-center gap-1.5">
-                {palette.map((color: string) => (
-                  <span
-                    key={color}
-                    className="h-5 w-5 rounded border border-border"
-                    style={{ backgroundColor: color }}
-                    title={color}
-                  />
-                ))}
-              </div>
-            ) : null}
-            {traits.map((trait) => (
-              <Badge
-                key={trait}
-                variant="outline"
-                className="max-w-52 truncate"
-              >
-                {trait}
-              </Badge>
-            ))}
-            {constraints.map((constraint: string) => (
-              <Badge
-                key={constraint}
-                variant="outline"
-                className="max-w-64 truncate text-muted-foreground"
-              >
-                Avoid {constraint}
-              </Badge>
-            ))}
-          </div>
-          {anchors.length ? (
-            <div className="flex items-center gap-2">
-              <span className="text-xs font-medium text-muted-foreground">
-                Anchors
-              </span>
-              <div className="flex -space-x-2">
-                {anchors.map((asset) => (
-                  <img
-                    key={asset.id}
-                    src={assetMediaUrl(asset.thumbnailUrl || asset.previewUrl)}
-                    alt=""
-                    className="h-8 w-8 rounded-md border border-background object-cover"
-                  />
-                ))}
-              </div>
-            </div>
-          ) : null}
-        </div>
-        <Button className="shrink-0 gap-2" onClick={onGenerate}>
-          <IconMessageCircle className="h-4 w-4" />
-          Generate
-        </Button>
-      </div>
-    </section>
-  );
-}
-
-function formatBrandAnalysisTime(value: unknown): string {
-  if (typeof value !== "string" || !value) return "unknown";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "unknown";
-  return new Intl.DateTimeFormat(undefined, {
-    dateStyle: "medium",
-    timeStyle: "short",
-  }).format(date);
-}
-
 function RunCard({
   run,
   outputAssets,
@@ -1356,10 +1447,23 @@ function assetDisplayTitle(asset: any): string {
   return (
     assetLineageLabel(asset) ||
     asset.title ||
-    asset.metadata?.category ||
+    assetCategoryLabel(asset) ||
     asset.status ||
     "Asset"
   );
+}
+
+function assetCategoryLabel(asset: any): string | null {
+  if (
+    asset?.metadata?.intent === "subject" ||
+    asset?.role === "subject_reference"
+  ) {
+    return "content only";
+  }
+  const category = asset?.metadata?.category;
+  if (typeof category !== "string") return null;
+  if (category === "style-only") return "style reference";
+  return category.replace(/-/g, " ");
 }
 
 function assetLineageSourceText(asset: any): string | null {
@@ -2457,9 +2561,9 @@ function AssetGrid({
                     ) : null}
                     <div className="flex items-center gap-2">
                       <Badge variant="secondary">{asset.status}</Badge>
-                      {asset.metadata?.category && (
+                      {assetCategoryLabel(asset) && (
                         <Badge variant="outline">
-                          {asset.metadata.category}
+                          {assetCategoryLabel(asset)}
                         </Badge>
                       )}
                     </div>
@@ -2481,14 +2585,29 @@ function AssetGrid({
   );
 }
 
-function VariantCard({ slot, onSave }: { slot: any; onSave: () => void }) {
+function VariantCard({
+  slot,
+  libraryId,
+  onSave,
+  saving = false,
+}: {
+  slot: any;
+  libraryId: string;
+  onSave: () => void;
+  saving?: boolean;
+}) {
   const dismissSlot = useActionMutation("dismiss-variant-slots");
+  const queryClient = useQueryClient();
   const [confirmOpen, setConfirmOpen] = useState(false);
   const isFailed = slot.status === "failed";
   const label = isFailed ? "Dismiss" : "Delete";
+  const busy = saving || dismissSlot.isPending;
 
   return (
-    <div className="group relative overflow-hidden rounded-lg border border-border bg-background">
+    <div
+      className="group relative overflow-hidden rounded-lg border border-border bg-background"
+      aria-busy={busy}
+    >
       <div className="absolute right-2 top-2 z-10">
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
@@ -2498,6 +2617,7 @@ function VariantCard({ slot, onSave }: { slot: any; onSave: () => void }) {
               size="icon"
               className="h-8 w-8 shadow-sm opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:focus-visible:opacity-100 data-[state=open]:opacity-100"
               aria-label="Candidate actions"
+              disabled={busy}
             >
               <IconDotsVertical className="h-4 w-4" />
             </Button>
@@ -2505,7 +2625,10 @@ function VariantCard({ slot, onSave }: { slot: any; onSave: () => void }) {
           <DropdownMenuContent align="end">
             <DropdownMenuItem
               className="text-destructive focus:bg-destructive/10 focus:text-destructive"
-              onSelect={() => setConfirmOpen(true)}
+              onSelect={(event) => {
+                event.preventDefault();
+                setConfirmOpen(true);
+              }}
             >
               <IconTrash className="mr-2 h-4 w-4 shrink-0" />
               {label}
@@ -2514,7 +2637,12 @@ function VariantCard({ slot, onSave }: { slot: any; onSave: () => void }) {
         </DropdownMenu>
       </div>
 
-      <AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}>
+      <AlertDialog
+        open={confirmOpen}
+        onOpenChange={(open) => {
+          if (!dismissSlot.isPending) setConfirmOpen(open);
+        }}
+      >
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>
@@ -2527,18 +2655,44 @@ function VariantCard({ slot, onSave }: { slot: any; onSave: () => void }) {
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogCancel disabled={dismissSlot.isPending}>
+              Cancel
+            </AlertDialogCancel>
             <AlertDialogAction
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
               disabled={dismissSlot.isPending}
-              onClick={() =>
+              onClick={(event) => {
+                event.preventDefault();
                 dismissSlot.mutate(
                   { slotId: slot.slotId },
-                  { onSuccess: () => setConfirmOpen(false) },
-                )
-              }
+                  {
+                    onSuccess: () => {
+                      removeVariantSlotFromCache(queryClient, slot);
+                      removeAssetsFromLibraryCache(queryClient, libraryId, [
+                        slot.assetId,
+                      ]);
+                      setConfirmOpen(false);
+                      void queryClient.invalidateQueries({
+                        queryKey: ["app-state", "asset-variants"],
+                        refetchType: "active",
+                      });
+                    },
+                    onError: (error) =>
+                      toast.error(
+                        error.message || "Could not clear candidate.",
+                      ),
+                  },
+                );
+              }}
             >
-              {label}
+              {dismissSlot.isPending ? (
+                <>
+                  <Spinner className="h-4 w-4" />
+                  {isFailed ? "Dismissing..." : "Deleting..."}
+                </>
+              ) : (
+                label
+              )}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -2564,8 +2718,15 @@ function VariantCard({ slot, onSave }: { slot: any; onSave: () => void }) {
           {slot.status}
         </Badge>
         {slot.status === "ready" && (
-          <Button size="sm" onClick={onSave}>
-            Save
+          <Button size="sm" className="w-24" onClick={onSave} disabled={busy}>
+            {saving ? (
+              <>
+                <Spinner className="h-4 w-4" />
+                Saving...
+              </>
+            ) : (
+              "Save"
+            )}
           </Button>
         )}
       </div>
@@ -2573,18 +2734,28 @@ function VariantCard({ slot, onSave }: { slot: any; onSave: () => void }) {
   );
 }
 
-function LiveCandidatesActions({ slots }: { slots: any[] }) {
+function LiveCandidatesActions({
+  slots,
+  libraryId,
+}: {
+  slots: any[];
+  libraryId: string;
+}) {
   const dismissSlots = useActionMutation("dismiss-variant-slots");
+  const queryClient = useQueryClient();
   const [pending, setPending] = useState<"failed" | "all" | null>(null);
   const failedCount = slots.filter((s) => s.status === "failed").length;
   const hasFailed = failedCount > 0;
+  const isClearing = dismissSlots.isPending;
+  const actionLabel = pending === "failed" ? "Dismiss failed" : "Clear all";
+  const busyLabel = pending === "failed" ? "Dismissing..." : "Clearing...";
 
   return (
     <>
       <AlertDialog
         open={pending !== null}
         onOpenChange={(open) => {
-          if (!open) setPending(null);
+          if (!open && !isClearing) setPending(null);
         }}
       >
         <AlertDialogContent>
@@ -2601,19 +2772,49 @@ function LiveCandidatesActions({ slots }: { slots: any[] }) {
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogCancel disabled={isClearing}>Cancel</AlertDialogCancel>
             <AlertDialogAction
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              disabled={dismissSlots.isPending || pending === null}
-              onClick={() => {
-                if (!pending) return;
+              disabled={isClearing || pending === null}
+              onClick={(event) => {
+                event.preventDefault();
+                const scope = pending;
+                if (!scope) return;
+                const removedAssetIds = slots
+                  .filter((slot) => scope === "all" || slot.status === "failed")
+                  .map((slot) => slot.assetId);
                 dismissSlots.mutate(
-                  { scope: pending },
-                  { onSuccess: () => setPending(null) },
+                  { scope },
+                  {
+                    onSuccess: () => {
+                      removeVariantSlotsByScopeFromCache(queryClient, scope);
+                      removeAssetsFromLibraryCache(
+                        queryClient,
+                        libraryId,
+                        removedAssetIds,
+                      );
+                      setPending(null);
+                      void queryClient.invalidateQueries({
+                        queryKey: ["app-state", "asset-variants"],
+                        refetchType: "active",
+                      });
+                    },
+                    onError: (error) =>
+                      toast.error(
+                        error.message || "Could not clear live candidates.",
+                      ),
+                  },
                 );
               }}
             >
-              {pending === "failed" ? "Dismiss failed" : "Clear all"}
+              {isClearing ? (
+                <>
+                  <Spinner className="h-4 w-4" />
+                  {busyLabel}
+                </>
+              ) : (
+                actionLabel
+              )}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -2627,6 +2828,7 @@ function LiveCandidatesActions({ slots }: { slots: any[] }) {
             size="sm"
             className="gap-2"
             aria-label="Live candidates actions"
+            disabled={isClearing}
           >
             <IconDotsVertical className="h-4 w-4" />
             Clear
@@ -2634,15 +2836,22 @@ function LiveCandidatesActions({ slots }: { slots: any[] }) {
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end">
           <DropdownMenuItem
-            disabled={!hasFailed}
-            onSelect={() => setPending("failed")}
+            disabled={!hasFailed || isClearing}
+            onSelect={(event) => {
+              event.preventDefault();
+              setPending("failed");
+            }}
           >
             <IconTrash className="mr-2 h-4 w-4 shrink-0" />
             Dismiss failed ({failedCount})
           </DropdownMenuItem>
           <DropdownMenuItem
             className="text-destructive focus:bg-destructive/10 focus:text-destructive"
-            onSelect={() => setPending("all")}
+            disabled={isClearing}
+            onSelect={(event) => {
+              event.preventDefault();
+              setPending("all");
+            }}
           >
             <IconTrash className="mr-2 h-4 w-4 shrink-0" />
             Clear all

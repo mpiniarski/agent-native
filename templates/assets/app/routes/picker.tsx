@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router";
 import {
   createEmbeddedAppBridge,
@@ -6,6 +6,9 @@ import {
 } from "@agent-native/embedding/bridge";
 import {
   agentNativePath,
+  appPath,
+  getEmbedAuthToken,
+  isEmbedAuthActive,
   sendMcpAppHostMessage,
   updateMcpAppModelContext,
   useActionMutation,
@@ -32,8 +35,12 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
+import { DEFAULT_LIBRARY_PRESETS } from "../../shared/library-presets";
 
 const ASPECT_RATIOS = ["16:9", "1:1", "9:16", "4:3", "3:4", "21:9"] as const;
+const GENERATION_COUNTS = [1, 2, 3, 4, 6] as const;
+const STARTER_PRESET = DEFAULT_LIBRARY_PRESETS[0];
+const STARTER_LIBRARY_ID = `starter:${STARTER_PRESET.id}`;
 type PickerMediaType = "image" | "video";
 
 type Asset = {
@@ -74,12 +81,23 @@ type GenerationConfig = {
   lastIssue?: { message?: unknown } | null;
 };
 
+type GenerationPreset = {
+  id: string;
+  title: string;
+  mediaType?: string | null;
+  aspectRatio?: string | null;
+  imageSize?: string | null;
+};
+
 type HostConfig = {
   mediaType?: PickerMediaType;
   prompt?: string;
   query?: string;
   libraryId?: string;
   aspectRatio?: string;
+  presetId?: string;
+  count?: number;
+  autoGenerate?: boolean;
 };
 
 function isEmbeddedWindow() {
@@ -91,6 +109,14 @@ function isEmbeddedWindow() {
   }
 }
 
+function normalizeCount(value: unknown): number {
+  if (value === null || value === undefined || value === "") return 3;
+  const count = Number(value);
+  if (!Number.isFinite(count)) return 3;
+  const rounded = Math.round(count);
+  return Math.min(6, Math.max(1, rounded));
+}
+
 function normalizeMediaType(value: unknown): PickerMediaType {
   return value === "video" ? "video" : "image";
 }
@@ -98,7 +124,7 @@ function normalizeMediaType(value: unknown): PickerMediaType {
 function normalizeHostConfig(value: unknown): HostConfig {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   const record = value as Record<string, unknown>;
-  return {
+  const config: HostConfig = {
     mediaType:
       record.mediaType === "image" || record.mediaType === "video"
         ? record.mediaType
@@ -109,17 +135,113 @@ function normalizeHostConfig(value: unknown): HostConfig {
       typeof record.libraryId === "string" ? record.libraryId : undefined,
     aspectRatio:
       typeof record.aspectRatio === "string" ? record.aspectRatio : undefined,
+    presetId: typeof record.presetId === "string" ? record.presetId : undefined,
+    count:
+      record.count === undefined ? undefined : normalizeCount(record.count),
   };
+  if (Object.prototype.hasOwnProperty.call(record, "autoGenerate")) {
+    config.autoGenerate =
+      record.autoGenerate === true ||
+      record.autoGenerate === "true" ||
+      record.autoGenerate === "1";
+  }
+  return config;
+}
+
+function embeddedAppOrigin() {
+  if (typeof window === "undefined") return undefined;
+  const externalOrigin =
+    typeof (window as any).__AGENT_NATIVE_EXTERNAL_EMBED?.origin === "string"
+      ? (window as any).__AGENT_NATIVE_EXTERNAL_EMBED.origin
+      : undefined;
+  if (externalOrigin) return externalOrigin;
+  if (typeof document === "undefined") return undefined;
+  const baseHref =
+    document.querySelector("base")?.getAttribute("href") ?? document.baseURI;
+  try {
+    const baseOrigin = new URL(baseHref).origin;
+    return baseOrigin === window.location.origin ? undefined : baseOrigin;
+  } catch {
+    return undefined;
+  }
+}
+
+function absoluteAppUrl(value: string) {
+  if (typeof window === "undefined") return value;
+  const path = value.startsWith("/") ? appPath(value) : value;
+  try {
+    return new URL(
+      path,
+      embeddedAppOrigin() ?? window.location.origin,
+    ).toString();
+  } catch {
+    return value;
+  }
 }
 
 function absoluteAssetUrl(value: string | undefined) {
   if (!value) return undefined;
   try {
-    const base =
-      typeof window !== "undefined" ? window.location.origin : undefined;
-    return new URL(value, base).toString();
+    const path =
+      value.startsWith("/") && !value.startsWith("//") ? appPath(value) : value;
+    return new URL(path, absoluteAppUrl("/")).toString();
   } catch {
     return value;
+  }
+}
+
+function shouldUseContentProxyForPreview(asset: Asset) {
+  if (typeof window === "undefined") return false;
+  if (!isEmbeddedWindow()) return false;
+  return (
+    asset.libraryId !== STARTER_LIBRARY_ID && !asset.id.startsWith("starter-")
+  );
+}
+
+function embedTokenParam() {
+  if (typeof window === "undefined") return null;
+  const externalToken =
+    typeof (window as any).__AGENT_NATIVE_EXTERNAL_EMBED?.token === "string"
+      ? (window as any).__AGENT_NATIVE_EXTERNAL_EMBED.token
+      : null;
+  if (externalToken) return externalToken;
+  return (
+    getEmbedAuthToken() ??
+    new URLSearchParams(window.location.search).get("__an_embed_token")
+  );
+}
+
+function assetContentUrl(asset: Asset, variant?: "thumb") {
+  const params = new URLSearchParams();
+  if (variant === "thumb") params.set("variant", "thumb");
+  const embedToken = embedTokenParam();
+  if (embedToken) params.set("__an_embed_token", embedToken);
+  const query = params.toString();
+  return absoluteAssetUrl(
+    `/api/assets/${asset.id}/content${query ? `?${query}` : ""}`,
+  );
+}
+
+function assetThumbnailSource(asset: Asset) {
+  if (shouldUseContentProxyForPreview(asset)) {
+    return assetContentUrl(asset, asset.thumbnailUrl ? "thumb" : undefined);
+  }
+  return (
+    asset.thumbnailUrl ?? asset.previewUrl ?? asset.downloadUrl ?? asset.url
+  );
+}
+
+function previewFetchCredentials(
+  source: string | undefined,
+): RequestCredentials {
+  if (!source || typeof window === "undefined") return "omit";
+  try {
+    return new URL(source, window.location.href).origin ===
+      window.location.origin
+      ? "same-origin"
+      : "omit";
+  } catch {
+    return "omit";
   }
 }
 
@@ -128,9 +250,17 @@ function assetPayload(asset: Asset, requestedMediaType: PickerMediaType) {
     asset.mediaType === "video" || asset.mimeType?.startsWith("video/")
       ? "video"
       : requestedMediaType;
-  const previewUrl = absoluteAssetUrl(asset.previewUrl);
+  const assetTitle = asset.title?.trim() ?? "";
+  const assetAltText = asset.altText?.trim() ?? "";
+  const assetPrompt = asset.prompt?.trim() ?? "";
+  const displayTitle = assetDisplayTitle(asset);
+  const fallbackLabel = assetTitle || assetPrompt || displayTitle || asset.id;
+  const embeddedContentUrl = shouldUseContentProxyForPreview(asset)
+    ? assetContentUrl(asset)
+    : undefined;
+  const previewUrl = absoluteAssetUrl(embeddedContentUrl ?? asset.previewUrl);
   const url = absoluteAssetUrl(
-    asset.previewUrl ?? asset.url ?? asset.downloadUrl,
+    embeddedContentUrl ?? asset.previewUrl ?? asset.downloadUrl ?? asset.url,
   );
   const thumbnailUrl = absoluteAssetUrl(asset.thumbnailUrl);
   const downloadUrl = absoluteAssetUrl(asset.downloadUrl);
@@ -146,8 +276,9 @@ function assetPayload(asset: Asset, requestedMediaType: PickerMediaType) {
     downloadUrl,
     embedUrl,
     embedPath: asset.embedPath,
-    altText: asset.altText ?? asset.title ?? "",
-    title: asset.title ?? "",
+    altText: assetAltText || fallbackLabel,
+    title: assetTitle || fallbackLabel,
+    prompt: asset.prompt ?? null,
     width: asset.width ?? null,
     height: asset.height ?? null,
     mimeType: asset.mimeType ?? null,
@@ -159,22 +290,107 @@ function selectedAssetText(payload: ReturnType<typeof assetPayload>) {
   return `Selected ${payload.mediaType} asset ${payload.assetId}${url ? `: ${url}` : ""}`;
 }
 
-function notifyMcpHost(payload: ReturnType<typeof assetPayload>) {
-  const context = { selectedAsset: payload };
-  const update = updateMcpAppModelContext({
-    structuredContent: context,
-    content: [{ type: "text", text: selectedAssetText(payload) }],
+function selectedAssetLabel(payload: ReturnType<typeof assetPayload>) {
+  const title = payload.title?.trim() ?? "";
+  const altText = payload.altText?.trim() ?? "";
+  const prompt = payload.prompt?.trim() ?? "";
+  const machineLikeTitle =
+    title === payload.assetId || /^[A-Za-z0-9_-]{12,}$/.test(title);
+  const genericGeneratedTitle = /^Original \d+$/i.test(title);
+  if (prompt && (!title || machineLikeTitle || genericGeneratedTitle)) {
+    return prompt;
+  }
+  if (altText && altText !== title) return altText;
+  if (title && !machineLikeTitle) return title;
+  return prompt || altText || title || payload.assetId;
+}
+
+function selectedAssetFollowUpMessage(
+  payload: ReturnType<typeof assetPayload>,
+) {
+  const url = payload.url ?? payload.downloadUrl ?? payload.previewUrl;
+  const label = selectedAssetLabel(payload);
+  return [
+    `Selected Assets ${payload.mediaType} for the next step: ${label}`,
+    url ? `URL: ${url}` : null,
+    "Use this selected asset in the current artifact or design.",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const value = typeof reader.result === "string" ? reader.result : "";
+      resolve(value.includes(",") ? value.split(",")[1] : value);
+    };
+    reader.onerror = () => reject(reader.error ?? new Error("Read failed"));
+    reader.readAsDataURL(blob);
   });
-  void Promise.resolve(update || false)
-    .then((updated) => {
-      if (updated) return true;
-      const sent = sendMcpAppHostMessage({
-        message: "Use the selected Assets item in this conversation.",
-        context: JSON.stringify(context, null, 2),
-      });
-      return sent || false;
-    })
-    .catch(() => false);
+}
+
+async function imageContentForAsset(payload: ReturnType<typeof assetPayload>) {
+  const url = payload.url ?? payload.downloadUrl ?? payload.previewUrl;
+  const mimeType = payload.mimeType?.startsWith("image/")
+    ? payload.mimeType
+    : "image/png";
+  if (!url || payload.mediaType !== "image") return null;
+  try {
+    const credentials =
+      typeof window !== "undefined" &&
+      new URL(url, window.location.href).origin === window.location.origin
+        ? "same-origin"
+        : "omit";
+    const response = await fetch(url, { credentials });
+    if (!response.ok) return null;
+    const blob = await response.blob();
+    const detectedMimeType = blob.type.startsWith("image/")
+      ? blob.type
+      : mimeType;
+    return {
+      type: "image",
+      data: await blobToBase64(blob),
+      mimeType: detectedMimeType,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function notifyMcpHost(payload: ReturnType<typeof assetPayload>) {
+  return Promise.resolve(imageContentForAsset(payload))
+    .catch(() => null)
+    .then((imageContent) => {
+      const context = { selectedAsset: payload };
+      const message = selectedAssetFollowUpMessage(payload);
+      const modelContent = [
+        { type: "text", text: selectedAssetText(payload) },
+        ...(imageContent ? [imageContent] : []),
+      ];
+      const chatContent = [
+        { type: "text", text: message },
+        ...(imageContent ? [imageContent] : []),
+      ];
+
+      return Promise.resolve(
+        updateMcpAppModelContext({
+          structuredContent: context,
+          content: modelContent,
+        }) || false,
+      )
+        .catch(() => false)
+        .then(() =>
+          Promise.resolve(
+            sendMcpAppHostMessage({
+              message,
+              context: JSON.stringify(context, null, 2),
+              content: chatContent,
+            }) || false,
+          ).catch(() => false),
+        );
+    });
 }
 
 function dimensions(asset: Asset) {
@@ -195,18 +411,85 @@ function assetContextLabel(asset: Asset) {
   return dimensions(asset);
 }
 
+function AssetThumbnail({ asset }: { asset: Asset }) {
+  const source = assetThumbnailSource(asset);
+  const proxiedPreview = shouldUseContentProxyForPreview(asset);
+  const [displayUrl, setDisplayUrl] = useState<string | undefined>(
+    proxiedPreview ? undefined : source,
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    const proxied = shouldUseContentProxyForPreview(asset);
+    if (!source) {
+      setDisplayUrl(undefined);
+      return;
+    }
+    if (!proxied) {
+      setDisplayUrl(source);
+      return;
+    }
+    setDisplayUrl(undefined);
+    fetch(source, {
+      cache: "no-store",
+      credentials: previewFetchCredentials(source),
+    })
+      .then(async (response) => {
+        if (!response.ok) throw new Error("Preview fetch failed");
+        const blob = await response.blob();
+        const base64 = await blobToBase64(blob);
+        return `data:${blob.type || asset.mimeType || "image/png"};base64,${base64}`;
+      })
+      .then((dataUrl) => {
+        if (!cancelled) setDisplayUrl(dataUrl);
+      })
+      .catch(() => {
+        if (!cancelled) setDisplayUrl(undefined);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [asset.mimeType, source]);
+
+  if (!displayUrl) {
+    return (
+      <div className="flex h-full w-full items-center justify-center text-muted-foreground">
+        <IconPhoto className="h-6 w-6" />
+      </div>
+    );
+  }
+
+  return (
+    <img
+      src={displayUrl}
+      alt={asset.altText ?? asset.title ?? ""}
+      className="h-full w-full object-cover transition group-hover:scale-[1.02]"
+    />
+  );
+}
+
 export default function AssetPicker() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
+  const searchParamsKey = searchParams.toString();
+  const urlHostConfig = useMemo(() => {
+    const params = new URLSearchParams(searchParamsKey);
+    return {
+      mediaType: normalizeMediaType(params.get("mediaType")),
+      prompt: params.get("prompt") ?? undefined,
+      query: params.get("q") ?? undefined,
+      libraryId: params.get("libraryId") ?? undefined,
+      aspectRatio: params.get("aspectRatio") ?? undefined,
+      presetId: params.get("presetId") ?? undefined,
+      count: normalizeCount(params.get("count")),
+      autoGenerate:
+        params.get("autoGenerate") === "1" ||
+        params.get("autoGenerate") === "true",
+    } satisfies HostConfig;
+  }, [searchParamsKey]);
   const bridgeRef = useRef<EmbeddedAppBridge | null>(null);
-  const embedded = useMemo(() => isEmbeddedWindow(), []);
-  const [hostConfig, setHostConfig] = useState<HostConfig>(() => ({
-    mediaType: normalizeMediaType(searchParams.get("mediaType")),
-    prompt: searchParams.get("prompt") ?? undefined,
-    query: searchParams.get("q") ?? undefined,
-    libraryId: searchParams.get("libraryId") ?? undefined,
-    aspectRatio: searchParams.get("aspectRatio") ?? undefined,
-  }));
+  const embedded = useMemo(() => isEmbeddedWindow() || isEmbedAuthActive(), []);
+  const [hostConfig, setHostConfig] = useState<HostConfig>(() => urlHostConfig);
   const [mediaType, setMediaType] = useState<PickerMediaType>(
     () => hostConfig.mediaType ?? "image",
   );
@@ -215,20 +498,64 @@ export default function AssetPicker() {
   const [aspectRatio, setAspectRatio] = useState<string>(
     () => hostConfig.aspectRatio ?? "16:9",
   );
+  const [presetId, setPresetId] = useState(() => hostConfig.presetId ?? "none");
+  const [count, setCount] = useState(() => hostConfig.count ?? 3);
   const [selectedLibraryId, setSelectedLibraryId] = useState(
     () => hostConfig.libraryId ?? "",
   );
-
-  const { data: libraryData } = useActionQuery("list-libraries", {
-    compact: true,
-  } as any) as { data?: { libraries?: Library[] } };
-  const libraries = libraryData?.libraries ?? [];
+  const [createdPickerLibrary, setCreatedPickerLibrary] =
+    useState<Library | null>(null);
+  const autoGenerateKeyRef = useRef<string | null>(null);
+  const autoCreateLibraryRef = useRef(false);
 
   useEffect(() => {
-    if (!selectedLibraryId && libraries[0]) {
-      setSelectedLibraryId(libraries[0].id);
+    setHostConfig((current) => ({ ...current, ...urlHostConfig }));
+    setMediaType(urlHostConfig.mediaType ?? "image");
+    setQuery(urlHostConfig.query ?? "");
+    setPrompt(urlHostConfig.prompt ?? "");
+    setSelectedLibraryId(urlHostConfig.libraryId ?? "");
+    setAspectRatio(urlHostConfig.aspectRatio ?? "16:9");
+    setPresetId(urlHostConfig.presetId ?? "none");
+    setCount(urlHostConfig.count ?? 3);
+  }, [urlHostConfig]);
+
+  const librariesQuery = useActionQuery("list-libraries", {
+    compact: true,
+  } as any) as {
+    data?: { libraries?: Library[] };
+  };
+  const libraryData = librariesQuery.data;
+  const libraryListReady = Array.isArray(libraryData?.libraries);
+  const libraries = libraryData?.libraries ?? [];
+  const starterLibrary: Library = useMemo(
+    () => ({
+      id: STARTER_LIBRARY_ID,
+      title: "Starter assets",
+      description: STARTER_PRESET.description,
+    }),
+    [],
+  );
+  const displayLibraries = libraries.length
+    ? libraries
+    : createdPickerLibrary
+      ? [createdPickerLibrary]
+      : [starterLibrary];
+
+  useEffect(() => {
+    const firstLibraryId = displayLibraries[0]?.id;
+    if (!firstLibraryId) return;
+    if (!selectedLibraryId) {
+      setSelectedLibraryId(firstLibraryId);
+      return;
     }
-  }, [libraries, selectedLibraryId]);
+    if (!libraryListReady) return;
+    const selectedLibraryExists = displayLibraries.some(
+      (library) => library.id === selectedLibraryId,
+    );
+    if (!selectedLibraryExists) {
+      setSelectedLibraryId(firstLibraryId);
+    }
+  }, [displayLibraries, libraryListReady, selectedLibraryId]);
 
   const { data: config } = useActionQuery(
     "get-image-generation-config",
@@ -237,9 +564,38 @@ export default function AssetPicker() {
     data?: GenerationConfig;
   };
 
-  const selectedLibrary = libraries.find(
+  const selectedLibrary = displayLibraries.find(
     (library) => library.id === selectedLibraryId,
   );
+  const usingStarterLibrary = selectedLibraryId === STARTER_LIBRARY_ID;
+  const {
+    data: presetData,
+    isLoading: presetsLoading,
+    isFetching: presetsFetching,
+    isPending: presetsPending,
+  } = useActionQuery(
+    "list-generation-presets",
+    { libraryId: selectedLibraryId } as any,
+    { enabled: Boolean(selectedLibraryId) && !usingStarterLibrary } as any,
+  ) as {
+    data?: { presets?: GenerationPreset[] };
+    isLoading?: boolean;
+    isFetching?: boolean;
+    isPending?: boolean;
+  };
+  const generationPresets =
+    presetData?.presets?.filter((preset) => preset.mediaType !== "video") ?? [];
+  const selectedPreset =
+    presetId === "none"
+      ? null
+      : (generationPresets.find((preset) => preset.id === presetId) ?? null);
+  const effectiveAspectRatio = selectedPreset?.aspectRatio || aspectRatio;
+  const waitingForRequestedPreset =
+    mediaType === "image" &&
+    presetId !== "none" &&
+    !usingStarterLibrary &&
+    Boolean(selectedLibraryId) &&
+    (presetsLoading || presetsFetching || presetsPending || !selectedPreset);
   const mediaLabel = mediaType === "video" ? "video" : "image";
   const assetsParams = useMemo(
     () => ({
@@ -252,9 +608,37 @@ export default function AssetPicker() {
   const { data: assetData, isLoading: assetsLoading } = useActionQuery(
     "list-assets",
     assetsParams as any,
-    { enabled: Boolean(selectedLibraryId) } as any,
+    { enabled: Boolean(selectedLibraryId) && !usingStarterLibrary } as any,
   ) as { data?: { assets?: Asset[] }; isLoading: boolean };
-  const assets = assetData?.assets ?? [];
+  const starterAssets: Asset[] = useMemo(
+    () =>
+      STARTER_PRESET.referenceImages.map((reference) => ({
+        id: `starter-${STARTER_PRESET.id}-${reference.id}`,
+        libraryId: STARTER_LIBRARY_ID,
+        title: reference.title,
+        description: reference.description,
+        altText: reference.title,
+        mediaType: "image",
+        mimeType: "image/webp",
+        url: absoluteAssetUrl(reference.path),
+        previewUrl: absoluteAssetUrl(reference.path),
+        thumbnailUrl: absoluteAssetUrl(reference.path),
+        downloadUrl: absoluteAssetUrl(reference.path),
+      })),
+    [],
+  );
+  const visibleStarterAssets = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    if (!needle) return starterAssets;
+    return starterAssets.filter((asset) =>
+      [asset.title, asset.description, asset.altText]
+        .filter(Boolean)
+        .some((value) => String(value).toLowerCase().includes(needle)),
+    );
+  }, [query, starterAssets]);
+  const assets = usingStarterLibrary
+    ? visibleStarterAssets
+    : (assetData?.assets ?? []);
 
   const chooseAsset = (asset: Asset) => {
     const payload = assetPayload(asset, mediaType);
@@ -262,24 +646,100 @@ export default function AssetPicker() {
     if (payload.mediaType === "image") {
       bridgeRef.current?.postMessage("chooseImage", payload);
     }
-    notifyMcpHost(payload);
+    const hostPost = notifyMcpHost(payload);
+    if (embedded) {
+      void hostPost.then((ok) => {
+        if (ok) {
+          toast.success(`Selected ${selectedAssetLabel(payload)}`);
+        } else {
+          toast.error("Could not send the selected asset back to chat");
+        }
+      });
+    }
     if (!embedded && !posted) {
       navigate(`/asset/${asset.id}`);
     }
   };
 
-  const generate = useActionMutation(
-    "generate-image" as any,
+  const createPickerLibrary = useActionMutation(
+    "create-library-from-preset" as any,
     {
-      onSuccess: (asset: Asset) => {
-        toast.success("Image generated");
-        chooseAsset(asset);
+      onSuccess: (result: any) => {
+        if (!result?.id) return;
+        const library = {
+          id: result.id,
+          title: result.title || "MCP image picks",
+          description: result.description ?? null,
+        };
+        setCreatedPickerLibrary(library);
+        setSelectedLibraryId(library.id);
+        setQuery("");
+      },
+      onError: (error: Error) => {
+        toast.error(error.message || "Could not prepare an image library");
+      },
+    } as any,
+  );
+
+  const generateBatch = useActionMutation(
+    "generate-image-batch" as any,
+    {
+      onSuccess: (result: any) => {
+        const images = Array.isArray(result?.images) ? result.images : [];
+        const generatedCount = images.filter((image: any) => image?.ok).length;
+        const failedCount = images.length - generatedCount;
+        if (generatedCount > 0) {
+          toast.success(
+            `Generated ${generatedCount} image candidate${
+              generatedCount === 1 ? "" : "s"
+            }`,
+            {
+              description:
+                failedCount > 0
+                  ? `${failedCount} candidate${
+                      failedCount === 1 ? "" : "s"
+                    } failed.`
+                  : "Pick the one you want to send back.",
+            },
+          );
+          setQuery("");
+        } else {
+          toast.error(
+            images[0]?.error ||
+              "Image generation finished without usable candidates.",
+          );
+        }
       },
       onError: (error: Error) => {
         toast.error(error.message || "Image generation failed");
       },
     } as any,
   );
+
+  const runGenerate = useCallback(() => {
+    if (!selectedLibraryId || !prompt.trim()) return;
+    if (waitingForRequestedPreset) return;
+    generateBatch.mutate({
+      libraryId: selectedLibraryId,
+      presetId: selectedPreset?.id,
+      slots: Array.from({ length: count }, (_, index) => ({
+        slotId: `picker-candidate-${index + 1}`,
+        prompt: prompt.trim(),
+        aspectRatio: effectiveAspectRatio,
+        imageSize: selectedPreset?.imageSize || "2K",
+        dismissible: false,
+      })),
+      source: "ui",
+    } as any);
+  }, [
+    count,
+    effectiveAspectRatio,
+    generateBatch,
+    prompt,
+    selectedLibraryId,
+    selectedPreset,
+    waitingForRequestedPreset,
+  ]);
 
   useEffect(() => {
     const bridge = createEmbeddedAppBridge({
@@ -292,6 +752,8 @@ export default function AssetPicker() {
         if (next.prompt !== undefined) setPrompt(next.prompt);
         if (next.libraryId !== undefined) setSelectedLibraryId(next.libraryId);
         if (next.aspectRatio !== undefined) setAspectRatio(next.aspectRatio);
+        if (next.presetId !== undefined) setPresetId(next.presetId || "none");
+        if (next.count !== undefined) setCount(next.count);
       },
     });
     bridgeRef.current = bridge;
@@ -323,8 +785,10 @@ export default function AssetPicker() {
   const canGenerate =
     mediaType === "image" &&
     Boolean(selectedLibraryId) &&
+    !usingStarterLibrary &&
     Boolean(prompt.trim()) &&
-    !generate.isPending;
+    !waitingForRequestedPreset &&
+    !generateBatch.isPending;
   const setupNeeded = mediaType === "image" && config?.configured === false;
   const setupMessage =
     typeof config?.lastIssue?.message === "string"
@@ -332,6 +796,72 @@ export default function AssetPicker() {
       : config?.builderEnabled === false
         ? "Add a Gemini key in Settings to generate image assets."
         : "Connect Builder.io or add a Gemini key in Settings to generate image assets.";
+  const needsGenerationLibrary =
+    mediaType === "image" &&
+    libraryListReady &&
+    !libraries.length &&
+    !createdPickerLibrary &&
+    usingStarterLibrary;
+  const preparingGenerationLibrary =
+    needsGenerationLibrary && createPickerLibrary.isPending;
+
+  useEffect(() => {
+    if (!selectedPreset?.aspectRatio) return;
+    setAspectRatio(selectedPreset.aspectRatio);
+  }, [selectedPreset?.aspectRatio]);
+
+  const prepareGenerationLibrary = useCallback(() => {
+    createPickerLibrary.mutate({
+      presetId: STARTER_PRESET.id,
+      title: "MCP image picks",
+      description: "Generated and selected images from MCP chat hosts.",
+    } as any);
+  }, [createPickerLibrary]);
+
+  useEffect(() => {
+    if (!prompt.trim()) return;
+    if (mediaType !== "image") return;
+    if (!needsGenerationLibrary || preparingGenerationLibrary) return;
+    if (autoCreateLibraryRef.current) return;
+    autoCreateLibraryRef.current = true;
+    prepareGenerationLibrary();
+  }, [
+    mediaType,
+    needsGenerationLibrary,
+    prepareGenerationLibrary,
+    preparingGenerationLibrary,
+    prompt,
+  ]);
+
+  useEffect(() => {
+    if (!hostConfig.autoGenerate) return;
+    if (!prompt.trim() || mediaType !== "image") return;
+    if (!canGenerate || setupNeeded || generateBatch.isPending) return;
+    if (waitingForRequestedPreset) return;
+    const key = [
+      selectedLibraryId,
+      prompt.trim(),
+      effectiveAspectRatio,
+      presetId,
+      count,
+    ].join("|");
+    if (autoGenerateKeyRef.current === key) return;
+    autoGenerateKeyRef.current = key;
+    runGenerate();
+  }, [
+    canGenerate,
+    count,
+    effectiveAspectRatio,
+    generateBatch.isPending,
+    hostConfig.autoGenerate,
+    mediaType,
+    presetId,
+    prompt,
+    runGenerate,
+    selectedLibraryId,
+    setupNeeded,
+    waitingForRequestedPreset,
+  ]);
 
   return (
     <div
@@ -363,9 +893,9 @@ export default function AssetPicker() {
         {embedded && (
           <div className="flex shrink-0 items-center gap-2">
             <Button asChild variant="ghost" size="icon" title="Open Assets">
-              <Link to="/" target="_blank" rel="noreferrer">
+              <a href={absoluteAppUrl("/")} target="_blank" rel="noreferrer">
                 <IconArrowUpRight className="h-4 w-4" />
-              </Link>
+              </a>
             </Button>
             <Button
               variant="ghost"
@@ -389,7 +919,7 @@ export default function AssetPicker() {
               <SelectValue placeholder="Library" />
             </SelectTrigger>
             <SelectContent>
-              {libraries.map((library) => (
+              {displayLibraries.map((library) => (
                 <SelectItem key={library.id} value={library.id}>
                   {library.title}
                 </SelectItem>
@@ -415,7 +945,7 @@ export default function AssetPicker() {
           </Button>
         </div>
 
-        <div className="mt-2 grid gap-2 md:grid-cols-[1fr_140px_auto]">
+        <div className="mt-2 grid gap-2 md:grid-cols-[1fr_116px_92px_minmax(150px,190px)_auto]">
           <Input
             value={prompt}
             onChange={(event) => setPrompt(event.target.value)}
@@ -439,21 +969,40 @@ export default function AssetPicker() {
               ))}
             </SelectContent>
           </Select>
-          <Button
-            className="h-9"
-            disabled={!canGenerate}
-            onClick={() => {
-              if (!selectedLibraryId || !prompt.trim()) return;
-              generate.mutate({
-                libraryId: selectedLibraryId,
-                prompt: prompt.trim(),
-                aspectRatio,
-                imageSize: "2K",
-                source: "ui",
-              } as any);
-            }}
+          <Select
+            value={String(count)}
+            onValueChange={(value) => setCount(normalizeCount(value))}
           >
-            {generate.isPending ? (
+            <SelectTrigger className="h-9">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {GENERATION_COUNTS.map((option) => (
+                <SelectItem key={option} value={String(option)}>
+                  {option}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Select
+            value={presetId}
+            onValueChange={(value) => setPresetId(value)}
+            disabled={!generationPresets.length}
+          >
+            <SelectTrigger className="h-9">
+              <SelectValue placeholder="Preset" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="none">No preset</SelectItem>
+              {generationPresets.map((preset) => (
+                <SelectItem key={preset.id} value={preset.id}>
+                  {preset.title}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Button className="h-9" disabled={!canGenerate} onClick={runGenerate}>
+            {generateBatch.isPending ? (
               <IconLoader2 className="h-4 w-4 animate-spin" />
             ) : (
               <IconPhotoPlus className="h-4 w-4" />
@@ -466,7 +1015,35 @@ export default function AssetPicker() {
           <div className="mt-2 flex items-center justify-between gap-3 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-950 dark:text-amber-100">
             <span className="min-w-0 truncate">{setupMessage}</span>
             <Button asChild variant="outline" size="sm" className="h-7">
-              <Link to="/settings">Settings</Link>
+              <a
+                href={absoluteAppUrl("/settings")}
+                target="_blank"
+                rel="noreferrer"
+              >
+                Settings
+              </a>
+            </Button>
+          </div>
+        )}
+
+        {!setupNeeded && needsGenerationLibrary && (
+          <div className="mt-2 flex items-center justify-between gap-3 rounded-md border border-border bg-muted/60 px-3 py-2 text-xs text-muted-foreground">
+            <span className="min-w-0 truncate">
+              {preparingGenerationLibrary
+                ? "Preparing an image library for generated candidates..."
+                : "Create an image library to generate new candidates."}
+            </span>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7"
+              onClick={prepareGenerationLibrary}
+              disabled={preparingGenerationLibrary}
+            >
+              {preparingGenerationLibrary ? (
+                <IconLoader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : null}
+              Create library
             </Button>
           </div>
         )}
@@ -520,11 +1097,7 @@ export default function AssetPicker() {
                       className="h-full w-full object-cover transition group-hover:scale-[1.02]"
                     />
                   ) : (
-                    <img
-                      src={asset.thumbnailUrl ?? asset.previewUrl}
-                      alt={asset.altText ?? asset.title ?? ""}
-                      className="h-full w-full object-cover transition group-hover:scale-[1.02]"
-                    />
+                    <AssetThumbnail asset={asset} />
                   )}
                 </div>
                 <div className="space-y-1 p-2">

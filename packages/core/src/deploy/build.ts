@@ -35,6 +35,12 @@ import {
 import { generateActionRegistryForProject } from "../vite/action-types-plugin.js";
 import { mcpEmbedStaticAssetRouteRules } from "../shared/mcp-embed-headers.js";
 import { AGENT_NATIVE_DEFAULT_SOCIAL_IMAGE } from "../shared/social-meta.js";
+import {
+  collectImmutableAssetPaths,
+  IMMUTABLE_ASSET_CACHE_CONTROL,
+  IMMUTABLE_ASSET_CACHE_HEADERS,
+  prefixAssetPath,
+} from "./immutable-assets.js";
 
 const cwd = process.cwd();
 const preset = process.env.NITRO_PRESET || "node";
@@ -65,6 +71,36 @@ function isNodeOnlyPlugin(filePath: string): boolean {
   return NODE_ONLY_PLUGINS.has(basename);
 }
 
+type RouteRules = Record<string, { headers?: Record<string, string> }>;
+
+function addImmutableAssetRouteRule(
+  routeRules: RouteRules,
+  pathname: string,
+): void {
+  const existing = routeRules[pathname] ?? {};
+  routeRules[pathname] = {
+    ...existing,
+    headers: {
+      ...(existing.headers ?? {}),
+      ...IMMUTABLE_ASSET_CACHE_HEADERS,
+    },
+  };
+}
+
+export function addImmutableAssetRouteRulesForClientBuild(
+  routeRules: RouteRules,
+  clientDir: string,
+  appBasePath = "",
+): void {
+  for (const assetPath of collectImmutableAssetPaths(clientDir)) {
+    addImmutableAssetRouteRule(routeRules, assetPath);
+    const mountedPath = prefixAssetPath(assetPath, appBasePath);
+    if (mountedPath !== assetPath) {
+      addImmutableAssetRouteRule(routeRules, mountedPath);
+    }
+  }
+}
+
 /**
  * Generate the worker entry source code that wires up H3 + React Router SSR.
  *
@@ -80,6 +116,7 @@ export function generateWorkerEntry(
   defaultPluginStems: string[] = [],
   actions: DiscoveredAction[] = [],
   workspaceCore: WorkspaceCoreExports | null = null,
+  immutableAssetPaths: string[] = [],
 ): string {
   const routeImports: string[] = [];
   const routeRegistrations: string[] = [];
@@ -307,6 +344,10 @@ function injectHeadScript(html, script) {
 }
 
 const DEFAULT_SSR_CACHE_CONTROL = ${JSON.stringify(DEFAULT_SSR_CACHE_CONTROL)};
+const IMMUTABLE_ASSET_CACHE_CONTROL = ${JSON.stringify(IMMUTABLE_ASSET_CACHE_CONTROL)};
+const IMMUTABLE_ASSET_PATHS = new Set(${JSON.stringify(
+    [...new Set(immutableAssetPaths)].sort(),
+  )});
 const AGENT_NATIVE_DEFAULT_SOCIAL_IMAGE = ${JSON.stringify(
     AGENT_NATIVE_DEFAULT_SOCIAL_IMAGE,
   )};
@@ -336,20 +377,74 @@ function injectDefaultSocialImageMeta(html) {
   return html.slice(0, headCloseIdx) + tags.join("") + html.slice(headCloseIdx);
 }
 
-function applyDefaultSsrCacheHeader(headers, status) {
-  if (headers.has("cache-control")) return;
-  if (status < 200 || status >= 400) return;
+const ANONYMOUS_SESSION_COOKIE_NAMES = new Set(["an_docs_session"]);
+const AUTH_SESSION_COOKIE_RE = /^(?:an_session(?:_[^=;]+)?|an_embed_session|[^=;]+\\.session_(?:token|data))$/;
+
+function requestHasAuthenticatedCookie(cookieHeader) {
+  if (!cookieHeader) return false;
+  return cookieHeader
+    .split(";")
+    .map((cookie) => cookie.trim().split("=", 1)[0]?.trim())
+    .filter(Boolean)
+    .map((name) => name.replace(/^__(?:Secure|Host)-/, ""))
+    .some((name) => !ANONYMOUS_SESSION_COOKIE_NAMES.has(name) && AUTH_SESSION_COOKIE_RE.test(name));
+}
+
+function requestHasAuthSignal(request) {
+  const url = new URL(request.url);
+  return Boolean(
+    request.headers.get("authorization") ||
+    requestHasAuthenticatedCookie(request.headers.get("cookie")) ||
+    url.searchParams.has("__an_embed_token") ||
+    url.searchParams.has("_session")
+  );
+}
+
+function shouldUseDefaultSsrCacheHeader(headers, status, pathname, hasAuthSignal) {
+  if (status < 200 || status >= 400) return false;
 
   const contentType = (headers.get("content-type") || "").toLowerCase();
-  if (!contentType.includes("text/html")) return;
+  if (contentType.includes("text/html")) {
+    return !headers.has("cache-control");
+  }
 
+  if (!pathname.endsWith(".data")) return false;
+  if (hasAuthSignal) return false;
+  if (!contentType.includes("text/x-script")) return false;
+
+  const cacheControl = headers.get("cache-control");
+  return !cacheControl || cacheControl.trim().toLowerCase() === "no-cache";
+}
+
+function applyDefaultSsrCacheHeader(headers, status, pathname, hasAuthSignal) {
+  if (!shouldUseDefaultSsrCacheHeader(headers, status, pathname, hasAuthSignal)) return;
   headers.set("cache-control", DEFAULT_SSR_CACHE_CONTROL);
 }
 
-async function rewriteMountedResponse(response, basePath) {
+function isImmutableAssetRequest(request) {
+  const pathname = stripAppBasePath(new URL(request.url).pathname);
+  return IMMUTABLE_ASSET_PATHS.has(pathname);
+}
+
+function applyImmutableAssetCacheHeaders(response, request) {
+  if (!isImmutableAssetRequest(request)) return response;
+  if (!((response.status >= 200 && response.status < 300) || response.status === 304)) {
+    return response;
+  }
+  const headers = new Headers(response.headers);
+  headers.set("Cache-Control", IMMUTABLE_ASSET_CACHE_CONTROL);
+  headers.set("CDN-Cache-Control", IMMUTABLE_ASSET_CACHE_CONTROL);
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+async function rewriteMountedResponse(response, basePath, pathname, hasAuthSignal) {
   const sentryClientConfigScript = getSentryClientConfigScript();
   const headers = new Headers(response.headers);
-  applyDefaultSsrCacheHeader(headers, response.status);
+  applyDefaultSsrCacheHeader(headers, response.status, pathname, hasAuthSignal);
 
   const location = headers.get("location");
   if (location?.startsWith("/") && !location.startsWith("//")) {
@@ -460,6 +555,7 @@ ${actionRegistrations.join("\n")}
       return new Response(null, { status: 404 });
     }
     const request = requestWithPathname(event.req, p);
+    const hasAuthSignal = requestHasAuthSignal(event.req);
     if (event.req.method === "HEAD") {
       const getRequest = requestWithMethod(request, "GET");
       const response = await rrHandler(getRequest);
@@ -470,9 +566,11 @@ ${actionRegistrations.join("\n")}
           headers: response.headers,
         }),
         basePath,
+        p,
+        hasAuthSignal,
       );
     }
-    return rewriteMountedResponse(await rrHandler(request), basePath);
+    return rewriteMountedResponse(await rrHandler(request), basePath, p, hasAuthSignal);
   }));
 
   _handler = app.fetch.bind(app);
@@ -504,7 +602,7 @@ export default {
       try {
         const assetResponse = await env.ASSETS.fetch(request);
         if (assetResponse.status !== 404) {
-          return assetResponse;
+          return applyImmutableAssetCacheHeaders(assetResponse, request);
         }
       } catch {
         // Asset fetch failed — fall through to SSR
@@ -584,12 +682,14 @@ async function buildCloudflarePages() {
   );
 
   // Generate the worker entry
+  const immutableAssetPaths = collectImmutableAssetPaths(clientDir);
   const entrySource = generateWorkerEntry(
     routes,
     plugins,
     missingDefaults,
     actions,
     workspaceCore,
+    immutableAssetPaths,
   );
 
   // Create _worker.js output directory
@@ -1247,6 +1347,12 @@ export async function runNitroBuildPipeline(
     if (appBasePath) {
       copyDir(clientDir, path.join(publicOutputDir, appBasePath.slice(1)));
     }
+    nitro.options.routeRules ??= {};
+    addImmutableAssetRouteRulesForClientBuild(
+      nitro.options.routeRules,
+      clientDir,
+      appBasePath,
+    );
     console.log(
       `[deploy] Copied client assets to ${path.relative(cwd, publicOutputDir)}`,
     );

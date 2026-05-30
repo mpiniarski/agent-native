@@ -6,6 +6,7 @@ import {
   ensureRequestRunContext,
 } from "./request-context.js";
 import { getSetting, putSetting } from "../settings/store.js";
+import { createDbAdminAgentTools } from "../db-admin/agent-tools.js";
 import {
   getH3App,
   markDefaultPluginProvided,
@@ -17,7 +18,6 @@ import {
   actionsToEngineTools,
   getActiveRunForThread,
   getActiveRunForThreadAsync,
-  getRun,
   abortRun,
   subscribeToRun,
   type ActionEntry,
@@ -62,6 +62,7 @@ import {
   mountMcpHubRoutes,
   buildMergedConfig,
   startMcpConfigRefresh,
+  areBuiltinMcpCapabilitiesSupported,
   setBuiltinMcpCapabilityEnabled,
   getHubStatus,
   isHubServeEnabled,
@@ -107,6 +108,7 @@ import {
   type ChatThreadScope,
   type ForkThreadSourceSnapshot,
 } from "../chat-threads/store.js";
+import { callerOwnsRun, callerOwnsThread } from "../agent/run-ownership.js";
 import {
   resourceList,
   resourceListAccessible,
@@ -1446,7 +1448,7 @@ function createBuilderBrowserTool(deps: {
     return { ok: true, enabledIds: enabledIds ?? [] };
   };
 
-  return {
+  const entries: Record<string, ActionEntry> = {
     "connect-builder": {
       tool: {
         description:
@@ -1678,6 +1680,13 @@ function createBuilderBrowserTool(deps: {
       },
     },
   };
+
+  if (!areBuiltinMcpCapabilitiesSupported()) {
+    delete entries["set-browser-control"];
+    delete entries["set-computer-use"];
+  }
+
+  return entries;
 }
 
 /**
@@ -2135,7 +2144,7 @@ On the user's first interaction, check \`readAppState("personalization")\`. If i
 
 ### Extended Capabilities
 
-You also have tools for: inline embeds, chat history search, agent teams/sub-agents, recurring jobs, A2A cross-app calls, structured memory, live embedded browser sessions (\`list-browser-sessions\`, \`view-browser-session\`, \`run-browser-session-action\`, \`send-browser-session-command\`), and browser automation (\`set-browser-control\` for built-in Chrome DevTools/Playwright MCP, \`activate-browser\` for Builder-provisioned Chrome). Call \`get-framework-context\` to read detailed instructions for any of these when needed.
+You also have tools for: inline embeds, chat history search, agent teams/sub-agents, recurring jobs, A2A cross-app calls, structured memory, live embedded browser sessions (\`list-browser-sessions\`, \`view-browser-session\`, \`run-browser-session-action\`, \`send-browser-session-command\`), and browser automation (\`activate-browser\` for Builder-provisioned Chrome; local development may also include \`set-browser-control\`). Call \`get-framework-context\` to read detailed instructions for any of these when needed.
 
 For brand-consistent generated media, use the first-party Assets agent via \`call-agent\` with agent "assets" when another app needs generated heroes, diagrams, product shots, thumbnails, videos, or design imagery. If this app has a native generation action, prefer that action because it may attach the asset to the local document/deck/design.
 `;
@@ -2232,7 +2241,7 @@ You can activate a real Chrome browser via Builder.io for tasks that need full p
 - Reading content from pages that require JavaScript execution
 
 **How to use:**
-1. Call \`set-browser-control\` with \`{"enabled":true,"backend":"chrome-devtools"}\` after confirming once with the user. Use \`activate-browser\` only when you specifically need Builder-provisioned Chrome.
+1. In local development, call \`set-browser-control\` with \`{"enabled":true,"backend":"chrome-devtools"}\` after confirming once with the user. In production, use \`activate-browser\` for Builder-provisioned Chrome.
 2. On your next action, use \`mcp__chrome-devtools__navigate_page\`, \`mcp__chrome-devtools__evaluate_script\`, \`mcp__chrome-devtools__take_screenshot\`, etc.
 3. If Builder is not connected, call \`connect-builder\` first
 
@@ -2431,7 +2440,7 @@ When the user asks to connect Builder.io, needs Builder for LLM access / browser
 
 ### Browser Automation
 
-Call \`set-browser-control\` to enable built-in browser MCP tools. Prefer \`backend:"chrome-devtools"\` for the user's live logged-in Chrome; use \`backend:"playwright"\` for isolated browser testing. After activation, MCP browser tools become available for navigating pages, reading rendered DOM, taking screenshots, and evaluating JavaScript on the next action. Use \`activate-browser\` only for Builder-provisioned browser sessions.
+In local development, call \`set-browser-control\` to enable built-in browser MCP tools. Prefer \`backend:"chrome-devtools"\` for the user's live logged-in Chrome; use \`backend:"playwright"\` for isolated browser testing. In production, use \`activate-browser\` for Builder-provisioned browser sessions.
 
 ### call-agent — External Apps Only
 
@@ -4804,6 +4813,9 @@ Non-code requests are still fine on this surface: read data, navigate the UI, su
                   ...browserTools,
                   ...mcpActionEntries,
                   ...(await createDevScriptRegistry()),
+                  // Dev-only full-database admin tools (gated to dev+localhost
+                  // by the surrounding `canToggle` block — never in prodActions).
+                  ...createDbAdminAgentTools(),
                 },
         );
         // Keep dev action dict in sync with runtime MCP additions. When
@@ -4904,9 +4916,17 @@ Non-code requests are still fine on this surface: read data, navigate the UI, su
               // Persistence is best-effort — in-memory flag still applies for
               // the lifetime of this process even if the settings write fails.
             }
-            return { devMode: currentDevMode, canToggle };
+            return {
+              devMode: currentDevMode,
+              codeMode: currentDevMode,
+              canToggle,
+            };
           }
-          return { devMode: currentDevMode, canToggle };
+          return {
+            devMode: currentDevMode,
+            codeMode: currentDevMode,
+            canToggle,
+          };
         }),
       );
 
@@ -5748,6 +5768,19 @@ Non-code requests are still fine on this surface: read data, navigate the UI, su
           const method = getMethod(event);
           const url = event.node?.req?.url || event.path || "";
 
+          // Authorization: a run's events/abort and a thread's active-run
+          // status must only be exposed to the user who OWNS the thread.
+          // agent_runs carries no owner column — ownership lives on the
+          // chat_threads row via thread_id. callerOwnsRun/callerOwnsThread
+          // (agent/run-ownership.ts) resolve the run's thread (in-memory first,
+          // SQL fallback) and compare its ownerEmail. Without this, any
+          // authenticated tenant who learns another tenant's runId/threadId
+          // could stream their live agent turn (assistant text + tool-result
+          // payloads) or abort their run.
+          const ownsThread = (threadId: string | null | undefined) =>
+            callerOwnsThread(owner, threadId);
+          const ownsRun = (runId: string) => callerOwnsRun(owner, runId);
+
           // Route: GET /runs/list?goalId=agent-team
           // Returns hosted Agent Teams in the Code hub-compatible run shape.
           const listMatch =
@@ -5775,6 +5808,11 @@ Non-code requests are still fine on this surface: read data, navigate the UI, su
             url.match(/^\/([^/?]+)\/abort/);
           if (abortMatch && method === "POST") {
             const runId = decodeURIComponent(abortMatch[1]);
+            if (!(await ownsRun(runId))) {
+              // 404 (not 403) so run existence isn't leaked to non-owners.
+              setResponseStatus(event, 404);
+              return { error: "Run not found" };
+            }
             let reason = "user";
             try {
               const body = await readBody(event);
@@ -5820,6 +5858,11 @@ Non-code requests are still fine on this surface: read data, navigate the UI, su
             url.match(/^\/([^/?]+)\/events/);
           if (eventsMatch && method === "GET") {
             const runId = decodeURIComponent(eventsMatch[1]);
+            if (!(await ownsRun(runId))) {
+              // 404 (not 403) so run existence isn't leaked to non-owners.
+              setResponseStatus(event, 404);
+              return { error: "Run not found" };
+            }
             const query = getQuery(event);
             const after = parseInt(String(query.after ?? "0"), 10) || 0;
 
@@ -5842,6 +5885,20 @@ Non-code requests are still fine on this surface: read data, navigate the UI, su
             if (!threadId) {
               setResponseStatus(event, 400);
               return { error: "threadId query parameter is required" };
+            }
+
+            // Only reveal a thread's active run to the thread's owner.
+            // Present non-owners (or unknown threads) as idle rather than
+            // 404 so thread existence isn't leaked and the client polls
+            // benignly.
+            if (!(await ownsThread(threadId))) {
+              return {
+                active: false,
+                threadId,
+                status: "idle",
+                heartbeatAt: null,
+                lastProgressAt: null,
+              };
             }
 
             // Check in-memory first, then SQL (cross-isolate on Workers)
