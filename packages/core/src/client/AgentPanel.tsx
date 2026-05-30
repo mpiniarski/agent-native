@@ -82,7 +82,10 @@ import { cn } from "./utils.js";
 import { agentNativePath } from "./api-path.js";
 import { trackEvent } from "./analytics.js";
 import { withBuilderConnectTrackingParams } from "./settings/useBuilderStatus.js";
-import { getFrameOrigin, isTrustedFrameMessage } from "./frame.js";
+import {
+  getFramePostMessageTargetOrigin,
+  isTrustedFrameMessage,
+} from "./frame.js";
 import { shouldParentFrameOwnAgentPanel } from "./builder-frame.js";
 import {
   consumeAgentSidebarUrlOpenOverride,
@@ -103,7 +106,7 @@ const AGENT_PANEL_OPEN_SETTINGS_EVENT = "agent-panel:open-settings";
 const AGENT_CHAT_RUNNING_EVENT = "agentNative.chatRunning";
 
 function parentFrameTargetOrigin(): string {
-  return getFrameOrigin() ?? window.location.origin;
+  return getFramePostMessageTargetOrigin() ?? window.location.origin;
 }
 
 // Lazy-load ResourcesPanel to avoid bundling when not needed
@@ -1340,6 +1343,7 @@ function AgentPanelInner({
             ".agent-tabs-scroll{scrollbar-width:none;-ms-overflow-style:none;}" +
             ".agent-tabs-scroll::-webkit-scrollbar{display:none;}" +
             `[data-agent-fullscreen='true'] .agent-thread-content,` +
+            `[data-agent-fullscreen='true'] .agent-running-activity,` +
             `[data-agent-fullscreen='true'] .agent-composer-area{` +
             `max-width:${FULLSCREEN_CONTENT_MAX_PX}px;` +
             `margin-left:auto;margin-right:auto;width:100%;}`,
