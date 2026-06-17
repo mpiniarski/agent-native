@@ -9,6 +9,7 @@ import {
   AGENT_NATIVE_SKILL_METADATA_FILE,
   parseSkillsArgs,
   runSkills,
+  selectionsToSkillTargets,
 } from "./skills.js";
 
 const tmpRoots: string[] = [];
@@ -57,6 +58,161 @@ describe("agent-native skills", () => {
       client: "claude-code",
       clientExplicit: true,
     });
+  });
+
+  it("selectionsToSkillTargets splits plain and app skills", () => {
+    expect(
+      selectionsToSkillTargets(["quick-recap", "assets", "visual-plan"]),
+    ).toEqual({
+      plainTargets: ["quick-recap"],
+      appTargets: ["assets", "visual-plan"],
+    });
+  });
+
+  it("selectionsToSkillTargets collapses both plan skills to visual-plans", () => {
+    expect(
+      selectionsToSkillTargets([
+        "visual-plan",
+        "visual-recap",
+        "stay-within-limits",
+      ]),
+    ).toEqual({
+      plainTargets: ["stay-within-limits"],
+      appTargets: ["visual-plans"],
+    });
+    expect(
+      selectionsToSkillTargets(["visual-plan", "visual-recap", "assets"]),
+    ).toEqual({
+      plainTargets: [],
+      appTargets: ["visual-plans", "assets"],
+    });
+  });
+
+  it("dry-runs plain skill repo installs through runSkills", async () => {
+    const root = tmpDir();
+    const stdout: string[] = [];
+    vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      stdout.push(String(chunk));
+      return true;
+    });
+
+    await runSkills(
+      [
+        "add",
+        "BuilderIO/skills",
+        "--skill",
+        "quick-recap",
+        "--client",
+        "codex",
+        "--scope",
+        "project",
+        "--dry-run",
+        "--json",
+      ],
+      { baseDir: root, isInteractive: () => false },
+    );
+
+    const withSkill = JSON.parse(stdout.join(""));
+    expect(withSkill).toMatchObject({
+      id: "BuilderIO/skills",
+      local: true,
+      skillNames: ["quick-recap"],
+      dryRun: true,
+    });
+    expect(withSkill.commands[0]).toContain("BuilderIO/skills");
+    expect(withSkill.commands[0]).toContain("--skill");
+    expect(withSkill.commands[0]).toContain("quick-recap");
+
+    stdout.length = 0;
+    await runSkills(
+      [
+        "add",
+        "BuilderIO/skills",
+        "--client",
+        "codex",
+        "--scope",
+        "project",
+        "--dry-run",
+        "--json",
+      ],
+      { baseDir: root, isInteractive: () => false },
+    );
+
+    const bareRepo = JSON.parse(stdout.join(""));
+    expect(bareRepo).toMatchObject({
+      id: "BuilderIO/skills",
+      local: true,
+      skillNames: [],
+      dryRun: true,
+    });
+    expect(bareRepo.commands[0]).toContain("BuilderIO/skills");
+    expect(bareRepo.commands[0]).not.toContain("--skill");
+  });
+
+  it("installs mixed plain and app skills from explicit --skill flags", async () => {
+    const root = tmpDir();
+    const stdout: string[] = [];
+    vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      stdout.push(String(chunk));
+      return true;
+    });
+
+    await runSkills(
+      [
+        "add",
+        "--skill",
+        "quick-recap",
+        "--skill",
+        "assets",
+        "--client",
+        "codex",
+        "--scope",
+        "project",
+        "--yes",
+        "--json",
+      ],
+      {
+        baseDir: root,
+        isInteractive: () => false,
+        runConnect: async () => {},
+        runCommand: async () => 0,
+      },
+    );
+
+    const results = JSON.parse(stdout.join(""));
+    expect(results).toHaveLength(2);
+    expect(results[0]).toMatchObject({
+      id: "BuilderIO/skills",
+      local: true,
+      skillNames: ["quick-recap"],
+    });
+    expect(results[1]).toMatchObject({
+      id: "assets",
+      skillNames: ["assets"],
+    });
+    expect(
+      fs.existsSync(path.join(root, ".agents", "skills", "assets", "SKILL.md")),
+    ).toBe(true);
+  });
+
+  it("lists app skills and remote plain skills", async () => {
+    const stdout: string[] = [];
+    vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      stdout.push(String(chunk));
+      return true;
+    });
+
+    await runSkills(["list"], {
+      listRemoteSkillCatalog: async () => [
+        { name: "quick-recap", description: "Status block convention" },
+      ],
+    });
+
+    const out = stdout.join("");
+    expect(out).toContain("Agent Native apps");
+    expect(out).toContain("assets");
+    expect(out).toContain("Plain skills");
+    expect(out).toContain("quick-recap");
   });
 
   it("authenticates by default and opts out with --no-connect", () => {
@@ -953,7 +1109,7 @@ describe("agent-native skills", () => {
     }
   });
 
-  it("offers only the two plan skills, both selected by default", async () => {
+  it("merges plan skills and remote plain skills in the interactive picker", async () => {
     const root = tmpDir();
     let context:
       | { initialTargets: string[]; options: { value: string }[] }
@@ -971,13 +1127,17 @@ describe("agent-native skills", () => {
       promptGithubAction: async () => false,
       runConnect: async () => {},
       runCommand: async () => 0,
+      listRemoteSkillCatalog: async () => [
+        { name: "quick-recap", description: "Status block convention" },
+        { name: "visual-plan", description: "duplicate from github" },
+      ],
     });
 
     expect(promptSkills).toHaveBeenCalledTimes(1);
-    expect(context?.options.map((o) => o.value)).toEqual([
-      "visual-plan",
-      "visual-recap",
-    ]);
+    expect(context?.options.map((option) => option.value)).toEqual(
+      expect.arrayContaining(["visual-plan", "visual-recap", "quick-recap"]),
+    );
+    expect(context?.options.map((option) => option.value)).toHaveLength(3);
     expect(context?.initialTargets).toEqual(["visual-plan", "visual-recap"]);
     // Both selected installs the whole plan bundle (one shared MCP connector).
     expect(

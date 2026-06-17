@@ -396,6 +396,9 @@ importers:
         specifier: ^4.3.6
         version: 4.4.3
     devDependencies:
+      '@agent-native/skills':
+        specifier: workspace:*
+        version: link:../skills
       '@ai-sdk/anthropic':
         specifier: ^3.0.71
         version: 3.0.71(zod@4.4.3)

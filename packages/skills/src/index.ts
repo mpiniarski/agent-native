@@ -116,7 +116,19 @@ Examples:
 `;
 
 const CLIENTS: SkillClient[] = ["codex", "claude-code"];
-const DEFAULT_SKILLS_SOURCE = "BuilderIO/skills";
+export const DEFAULT_SKILLS_SOURCE = "BuilderIO/skills";
+
+/** List installable skills from the remote BuilderIO/skills repo (no core delegation). */
+export async function listRemoteSkillCatalog(
+  source: string = DEFAULT_SKILLS_SOURCE,
+): Promise<SkillEntry[]> {
+  const materialized = await materializeSource(source);
+  try {
+    return discoverSkills(materialized.root);
+  } finally {
+    materialized.cleanup?.();
+  }
+}
 const MANAGED_INSTRUCTIONS_START = "<!-- BEGIN @agent-native/skills -->";
 const MANAGED_INSTRUCTIONS_END = "<!-- END @agent-native/skills -->";
 
@@ -211,8 +223,15 @@ export function parseSkillsCliArgs(argv: string[]): ParsedArgs {
 function toCoreSkillsArgv(parsed: ParsedArgs): string[] {
   const out: string[] = [parsed.command];
   if (parsed.command !== "add") return out;
-  if (parsed.skillNames.length === 1) out.push(parsed.skillNames[0]);
-  else if (parsed.copySource && parsed.source) out.push(parsed.source);
+  if (parsed.skillNames.length === 1) {
+    out.push(parsed.skillNames[0]);
+  } else if (parsed.skillNames.length > 1) {
+    for (const skill of parsed.skillNames) {
+      out.push("--skill", skill);
+    }
+  } else if (parsed.copySource && parsed.source) {
+    out.push(parsed.source);
+  }
   if (parsed.clients.length) out.push("--client", parsed.clients.join(","));
   if (parsed.scopeExplicit) out.push("--scope", parsed.scope);
   if (parsed.yes) out.push("--yes");
@@ -232,26 +251,19 @@ export async function runSkillsCli(
 ): Promise<void> {
   const parsed = parseSkillsCliArgs(argv);
 
-  // PIVOT: `@agent-native/skills` delegates its install/list flow to
-  // `@agent-native/core`'s clack-based installer so both CLIs share ONE codebase
-  // and UX. App-backed skills (visual-plan/visual-recap/assets/design-exploration/
-  // context-xray) and the interactive picker go through core. Plain BuilderIO
-  // skills (efficient-fable, quick-recap, …) aren't known to core, so an explicit
-  // plain `--skill` falls through to this package's own headless installer.
-  // AGENT_NATIVE_SKILLS_DIRECT=1 (set when core delegates a plain repo back to us)
-  // always forces the direct path and breaks the skills → core → skills loop.
-  if (process.env.AGENT_NATIVE_SKILLS_DIRECT !== "1") {
-    const appOnly =
-      parsed.skillNames.length === 0 ||
-      parsed.skillNames.every((name) => resolveAppForSkill(name) !== undefined);
-    if (parsed.command === "list" || (parsed.command === "add" && appOnly)) {
-      const { runSkills } = await import("@agent-native/core/cli/skills");
-      await runSkills(toCoreSkillsArgv(parsed), {
-        isInteractive: options.isInteractive,
-        baseDir: parsed.baseDir ?? options.baseDir,
-      });
-      return;
-    }
+  // Delegate add/list to `@agent-native/core` for one Clack-based installer that
+  // merges Agent Native app skills with the BuilderIO/skills catalog. Core calls
+  // back into this package for plain file copies via AGENT_NATIVE_SKILLS_DIRECT=1.
+  if (
+    process.env.AGENT_NATIVE_SKILLS_DIRECT !== "1" &&
+    (parsed.command === "add" || parsed.command === "list")
+  ) {
+    const { runSkills } = await import("@agent-native/core/cli/skills");
+    await runSkills(toCoreSkillsArgv(parsed), {
+      isInteractive: options.isInteractive,
+      baseDir: parsed.baseDir ?? options.baseDir,
+    });
+    return;
   }
 
   const startedAt = Date.now();

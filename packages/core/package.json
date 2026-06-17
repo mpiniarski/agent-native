@@ -351,9 +351,13 @@
     },
     "postgres": {
       "optional": true
+    },
+    "@agent-native/skills": {
+      "optional": true
     }
   },
   "devDependencies": {
+    "@agent-native/skills": "workspace:*",
     "@ai-sdk/anthropic": "^3.0.71",
     "@ai-sdk/google": "^3.0.64",
     "@ai-sdk/groq": "^3.0.35",

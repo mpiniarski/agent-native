@@ -3,7 +3,11 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { installSkills, parseSkillsCliArgs } from "./index.js";
+import {
+  installSkills,
+  listRemoteSkillCatalog,
+  parseSkillsCliArgs,
+} from "./index.js";
 
 const tmpRoots: string[] = [];
 
@@ -56,6 +60,18 @@ describe("@agent-native/skills", () => {
     expect(() => parseSkillsCliArgs(["add", "someone/else"])).toThrow(
       "installs the BuilderIO skills collection",
     );
+  });
+
+  it("lists skills from a local repo path", async () => {
+    const repo = tmpDir();
+    writeSkill(repo, "quick-recap");
+    writeSkill(repo, "efficient-fable");
+
+    const skills = await listRemoteSkillCatalog(repo);
+    expect(skills.map((skill) => skill.name).sort()).toEqual([
+      "efficient-fable",
+      "quick-recap",
+    ]);
   });
 
   it("parses compatibility flags used by agent-native core", () => {

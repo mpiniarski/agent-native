@@ -32,6 +32,10 @@ import {
 } from "./context-xray-local.js";
 import { CLIENTS, type ClientId } from "./mcp-config-writers.js";
 import { PR_VISUAL_RECAP_SETUP, writePrVisualRecapWorkflow } from "./recap.js";
+import {
+  DEFAULT_SKILLS_SOURCE,
+  listRemoteSkillCatalog,
+} from "@agent-native/skills";
 
 const HELP = `npx @agent-native/core@latest skills
 
@@ -2180,6 +2184,20 @@ interface RunSkillsOptions {
    * `addAgentNativeSkill` is called directly (e.g. tests).
    */
   telemetry?: CliTelemetry;
+  /** Override remote plain-skill catalog discovery (tests). */
+  listRemoteSkillCatalog?: () => Promise<
+    Array<{ name: string; description?: string }>
+  >;
+}
+
+export interface SkillTargets {
+  plainTargets: string[];
+  appTargets: string[];
+  /** Explicit plain skill repo (`BuilderIO/skills`, path, GitHub URL). */
+  repo?: string;
+  /** Raw interactive picker counts — for selectedAll funnel telemetry. */
+  pickerOfferedCount?: number;
+  pickerSelectedCount?: number;
 }
 
 interface SkillsClientPromptContext {
@@ -2631,11 +2649,9 @@ function clientPromptOptions(): SkillsClientPromptContext["options"] {
   }));
 }
 
-// For now the interactive installer offers only the two plan skills, each as
-// an independently selectable entry (uncheck one to install just the other).
-// The other built-in skills stay installable via `agent-native skills add
-// <name>` but are hidden from the default checklist. The values are the real
-// slash-command names so users see exactly what they are installing.
+// Merged picker: plan skills (pre-checked) + plain remote skills from
+// `@agent-native/skills`. App names win when both catalogs list the same skill.
+// Other app skills (assets, design, …) stay on `skills add <name>`.
 const PLAN_SKILL_PROMPT_OPTIONS: SkillsTargetPromptContext["options"] = [
   {
     value: "visual-plan",
@@ -2649,8 +2665,97 @@ const PLAN_SKILL_PROMPT_OPTIONS: SkillsTargetPromptContext["options"] = [
   },
 ];
 
-function skillPromptOptions(): SkillsTargetPromptContext["options"] {
-  return PLAN_SKILL_PROMPT_OPTIONS;
+const PLAN_PICKER_DEFAULTS = PLAN_SKILL_PROMPT_OPTIONS.map(
+  (option) => option.value,
+);
+
+export function selectionsToSkillTargets(selected: string[]): SkillTargets {
+  const plainTargets: string[] = [];
+  const appTargets: string[] = [];
+  for (const name of selected) {
+    if (!normalizeKnownSkillTarget(name)) plainTargets.push(name);
+    else appTargets.push(name);
+  }
+  // Both plan skills share one MCP connector — replace the pair with one bundle.
+  const bothPlanSkills = PLAN_PICKER_DEFAULTS.every((skill) =>
+    appTargets.includes(skill),
+  );
+  if (bothPlanSkills) {
+    return {
+      plainTargets,
+      appTargets: [
+        "visual-plans",
+        ...appTargets.filter(
+          (target) => !PLAN_PICKER_DEFAULTS.includes(target),
+        ),
+      ],
+    };
+  }
+  return { plainTargets, appTargets };
+}
+
+async function loadPlainRemoteSkills(options: RunSkillsOptions) {
+  try {
+    const list = options.listRemoteSkillCatalog ?? listRemoteSkillCatalog;
+    const skills = (await list()).filter(
+      (skill) => !normalizeKnownSkillTarget(skill.name),
+    );
+    return { skills };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      skills: [],
+      warning: `Could not load remote skill catalog (${message}). Showing Agent Native app skills only.`,
+    };
+  }
+}
+
+async function resolveSkillTargets(
+  parsed: ParsedSkillsArgs,
+  options: RunSkillsOptions,
+): Promise<SkillTargets | null> {
+  if (parsed.target || !shouldPrompt(parsed, options)) {
+    if (parsed.target && isPlainSkillRepoTarget(parsed.target)) {
+      return {
+        plainTargets: parsed.plainSkillNames ?? [],
+        appTargets: [],
+        repo: parsed.target,
+      };
+    }
+    const names = [
+      ...(parsed.target ? [parsed.target] : []),
+      ...(parsed.plainSkillNames ?? []),
+    ];
+    return selectionsToSkillTargets(names.length ? names : ["assets"]);
+  }
+
+  const prompt = options.promptSkills ?? promptForSkills;
+  const { skills: remoteSkills, warning: plainCatalogWarning } =
+    await loadPlainRemoteSkills(options);
+  const promptOptions = [
+    ...PLAN_SKILL_PROMPT_OPTIONS,
+    ...remoteSkills.map((skill) => ({
+      value: skill.name,
+      label: skill.name,
+      hint: skill.description ?? "Plain skill convention",
+    })),
+  ];
+  options.telemetry?.track("skills_cli skills prompted", {
+    availableCount: promptOptions.length,
+    available: promptOptions.map((option) => option.value).join(","),
+  });
+  if (plainCatalogWarning) options.log?.(plainCatalogWarning);
+
+  const selected = await prompt({
+    initialTargets: [...PLAN_PICKER_DEFAULTS],
+    options: promptOptions,
+  });
+  if (!selected?.length) return null;
+  return {
+    ...selectionsToSkillTargets(selected),
+    pickerOfferedCount: promptOptions.length,
+    pickerSelectedCount: selected.length,
+  };
 }
 
 function prVisualRecapWorkflowPath(baseDir: string): string {
@@ -2784,39 +2889,6 @@ async function resolveSkillsClients(
     try {
       writeConnectClientPreferences(selected);
     } catch {}
-  }
-  return selected;
-}
-
-async function resolveSkillTargets(
-  parsed: ParsedSkillsArgs,
-  options: RunSkillsOptions,
-): Promise<string[] | null> {
-  if (parsed.target || !shouldPrompt(parsed, options)) {
-    return [parsed.target ?? "assets"];
-  }
-  const prompt = options.promptSkills ?? promptForSkills;
-  const promptOptions = skillPromptOptions();
-  // The interactive multiselect skill picker is about to be shown (no --skill /
-  // target passed and we are interactive) — record the funnel "prompted" step.
-  options.telemetry?.track("skills_cli skills prompted", {
-    availableCount: promptOptions.length,
-    available: promptOptions.map((option) => option.value).join(","),
-  });
-  const selected = await prompt({
-    initialTargets: ["visual-plan", "visual-recap"],
-    options: promptOptions,
-  });
-  if (!selected || selected.length === 0) return null;
-  // Both plan skills share one MCP connector, so when both are selected install
-  // them through the bundle target — that registers/authenticates the connector
-  // once instead of twice.
-  const planSubskills = ["visual-plan", "visual-recap"];
-  if (planSubskills.every((skill) => selected.includes(skill))) {
-    return [
-      "visual-plans",
-      ...selected.filter((s) => !planSubskills.includes(s)),
-    ];
   }
   return selected;
 }
@@ -3235,7 +3307,7 @@ async function addPlainSkillRepo(
   return {
     id: target,
     displayName: target,
-    skillNames: [],
+    skillNames: parsed.plainSkillNames ?? [],
     skillsAgents,
     mcpUrl: "",
     mcpClients: [],
@@ -3768,11 +3840,10 @@ export async function runSkills(
     return;
   }
 
-  // `@agent-native/skills` now delegates its interactive install to this
-  // function. For plain skill repos we still shell out to
-  // `npx @agent-native/skills add …`; this env guard tells that child process
-  // to run its OWN headless installer instead of bouncing back into core,
-  // which would otherwise be an infinite skills → core → skills loop.
+  // `@agent-native/skills` delegates add/list here for one Clack installer that
+  // merges app-backed skills with the remote plain-skill catalog. Plain copies
+  // shell out to `npx @agent-native/skills add …`; AGENT_NATIVE_SKILLS_DIRECT=1
+  // on that child process prevents a skills → core loop.
   process.env.AGENT_NATIVE_SKILLS_DIRECT = "1";
 
   // Best-effort install-funnel telemetry. Created once per run and flushed in a
@@ -3793,16 +3864,24 @@ export async function runSkills(
     telemetry.track("skills_cli started");
 
     if (parsed.command === "list") {
-      const skills = listSkills();
+      const appSkills = listSkills();
+      const { skills: plainSkills, warning: plainCatalogWarning } =
+        await loadPlainRemoteSkills(options);
       telemetry.track("skills_cli skills listed", {
-        availableCount: skills.length,
-        available: skills.map((skill) => skill.id).join(","),
+        availableCount: appSkills.length + plainSkills.length,
+        available: [
+          ...appSkills.map((skill) => skill.id),
+          ...plainSkills.map((skill) => skill.name),
+        ].join(","),
       });
       if (parsed.printJson) {
-        process.stdout.write(`${JSON.stringify(skills, null, 2)}\n`);
+        process.stdout.write(
+          `${JSON.stringify({ apps: appSkills, plain: plainSkills }, null, 2)}\n`,
+        );
         return;
       }
-      for (const skill of skills) {
+      process.stdout.write("Agent Native apps\n");
+      for (const skill of appSkills) {
         const description = skill.description.replace(/[.?!]?$/, ".");
         const aliases = skill.aliases.length
           ? ` Aliases: ${skill.aliases.join(", ")}.`
@@ -3812,6 +3891,14 @@ export async function runSkills(
           `${skill.id.padEnd(12)} ${description}${aliases} (${target})\n`,
         );
       }
+      process.stdout.write("\nPlain skills\n");
+      for (const skill of plainSkills) {
+        process.stdout.write(
+          `${skill.name}${skill.description ? ` - ${skill.description}` : ""}\n`,
+        );
+      }
+      if (plainCatalogWarning)
+        process.stdout.write(`\n${plainCatalogWarning}\n`);
       return;
     }
 
@@ -3825,14 +3912,23 @@ export async function runSkills(
       telemetry.track("skills_cli cancelled", { step: "skills" });
       return;
     }
-    const preselected = Boolean(parsed.target);
+    const preselected = Boolean(
+      parsed.target || parsed.plainSkillNames?.length,
+    );
+    const selectedSummary = [
+      ...(targets.repo ? [targets.repo] : []),
+      ...targets.plainTargets,
+      ...targets.appTargets,
+    ];
     telemetry.track("skills_cli skills selected", {
-      selected: targets.join(","),
-      selectedCount: targets.length,
-      // Best-effort "took everything offered" signal: compare against the
-      // interactive picker's option count (the plan sub-skills collapse into a
-      // single bundle target, so this is approximate, like the standalone CLI).
-      selectedAll: targets.length === skillPromptOptions().length,
+      selected: selectedSummary.join(","),
+      selectedCount: selectedSummary.length,
+      // Best-effort "took everything offered" signal: compare raw picker
+      // selection to option count (install targets may collapse, e.g. visual-plans).
+      selectedAll:
+        targets.pickerOfferedCount != null
+          ? targets.pickerSelectedCount === targets.pickerOfferedCount
+          : false,
       preselected,
     });
 
@@ -3864,7 +3960,7 @@ export async function runSkills(
     // disk. The choice is threaded into each install via `withGithubAction` +
     // `githubActionResolved` (so addAgentNativeSkill doesn't re-prompt mid-flow).
     const recapBaseDir = options.baseDir ?? process.cwd();
-    const anyRecapTarget = targets.some((target) => {
+    const anyRecapTarget = targets.appTargets.some((target) => {
       if (normalizeKnownSkillTarget(target) !== "visual-plans") return false;
       const only = builtInOnlySkillNames(target);
       return !only || only.includes("visual-recap");
@@ -3888,7 +3984,24 @@ export async function runSkills(
     }
 
     const results: SkillsAddResult[] = [];
-    for (const target of targets) {
+    const plainSource =
+      targets.repo ??
+      (targets.plainTargets.length > 0 ? DEFAULT_SKILLS_SOURCE : undefined);
+    if (plainSource) {
+      results.push(
+        await addPlainSkillRepo(
+          {
+            ...parsed,
+            target: plainSource,
+            plainSkillNames: targets.plainTargets,
+            client: clientArgForClients(clients),
+            clients,
+          },
+          optionsWithTelemetry,
+        ),
+      );
+    }
+    for (const target of targets.appTargets) {
       results.push(
         await addAgentNativeSkill(
           {
