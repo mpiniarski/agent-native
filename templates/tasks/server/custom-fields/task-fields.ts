@@ -1,4 +1,5 @@
 import type { StoredCustomFieldValue } from "../db/schema.js";
+import { NotFoundError } from "../errors.js";
 import { getTask, type Task } from "../tasks/store.js";
 import { parseStoredValue } from "./parse.js";
 import { listCustomFields } from "./store.js";
@@ -19,13 +20,13 @@ function valuesByFieldId(
   rows: StoredCustomFieldValue[],
   fieldsByIdMap: Map<string, FieldDefinition>,
 ): Map<string, FieldValue | null> {
-  return new Map(
-    rows.map((row) => {
-      const field = fieldsByIdMap.get(row.fieldId);
-      if (!field) throw new Error("Custom field not found.");
-      return [row.fieldId, parseStoredValue(field, row)] as const;
-    }),
-  );
+  const entries: (readonly [string, FieldValue | null])[] = [];
+  for (const row of rows) {
+    const field = fieldsByIdMap.get(row.fieldId);
+    if (!field) continue;
+    entries.push([row.fieldId, parseStoredValue(field, row)] as const);
+  }
+  return new Map(entries);
 }
 
 function valuesByTaskId(
@@ -40,7 +41,7 @@ function valuesByTaskId(
       result.set(row.taskId, values);
     }
     const field = fieldsByIdMap.get(row.fieldId);
-    if (!field) throw new Error("Custom field not found.");
+    if (!field) continue;
     values.set(row.fieldId, parseStoredValue(field, row));
   }
   return result;
@@ -64,7 +65,7 @@ export async function listTaskFieldValues(input: {
     ownerEmail: input.ownerEmail,
     id: input.taskId,
   });
-  if (!task) throw new Error("Task not found.");
+  if (!task) throw new NotFoundError("Task not found.");
 
   const [{ fields }, rows] = await Promise.all([
     listCustomFields({ ownerEmail: input.ownerEmail }),
