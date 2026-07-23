@@ -11,33 +11,31 @@ order: 6
 
 ## What it is
 
-**Search** finds [F1 tasks](./f1-tasks.mdx) and [F3 projects](./f3-projects.mdx) by typing a query — a fast way to jump to something known instead of browsing [F5 views](./f5-views.mdx) or scrolling the list. Search uses **titles and names only** — not [custom field](./f2-custom-fields.mdx) values.
+**Search** is a global overlay for quickly opening [F1 tasks](./f1-tasks.mdx), [F3 projects](./f3-projects.mdx), and saved [F5 views](./f5-views.mdx). Results update as the user types, without leaving the current screen.
+
+Search uses **titles and names only** — not [custom field](./f2-custom-fields.mdx) values. Not-ready [inbox items](./f4-inbox.mdx) are excluded.
 
 ## What users can do
 
-- **Search** from a global entry.
+- **Open** search from a global entry.
 - **Find tasks** by title.
 - **Find projects** by name.
-- **Open** a result to go to that task or project.
-- **Clear** search to return to the previous screen.
+- **Find saved views** by name.
+- **Open** a result to navigate to it.
+- **Close** search to return to the unchanged screen underneath.
 
 ## How it behaves
 
 - **Substring match**, case-insensitive — "report" finds "Draft Q2 report".
-- Results grouped by type (task vs project).
-
-### Scope
-
-| Search from             | Tasks                 | Projects |
-| ----------------------- | --------------------- | -------- |
-| Global / main           | All tasks             | All      |
-| Project page            | Tasks in that project | —        |
-| [Inbox](./f4-inbox.mdx) | Not-ready inbox items | —        |
-
-Search complements views — it jumps to items; views arrange a list you're already on.
-
-## Limits (v1)
-
-- Task search matches **title** only — not description, due date, or other [custom fields](./f2-custom-fields.mdx).
-- No saved searches — use [F5 views](./f5-views.mdx) for repeatable filters.
-- No fuzzy match or ranking.
+- Results appear directly below the search input in separate sections:
+  - **Tasks** — incomplete and completed tasks whose title matches the query.
+  - **Projects** — matching project names.
+  - **Views** — matching saved-view names.
+- Empty sections are omitted.
+- Completed tasks appear alongside incomplete tasks with their completed state shown visually.
+- Search is global regardless of the current page.
+- Project-scoped tasks and views show their project name so duplicate titles remain distinguishable.
+- Selecting a result closes the overlay:
+  - A **task** result opens the main task view with that task selected.
+  - A **project** result opens the project.
+  - A **view** result opens that saved view in its global or project scope.

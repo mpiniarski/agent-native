@@ -1,7 +1,7 @@
 ---
 id: F1
 title: Tasks
-status: partial
+status: done
 order: 1
 ---
 
@@ -9,9 +9,9 @@ order: 1
 
 ## What it is
 
-A **task** is a unit of work with a **title** and a built-in **complete / incomplete** state. Tasks appear on the **main task page**.
+A **task** is a unit of work with a **title** and a built-in **complete / incomplete** state. Tasks appear on the **main task page**, can be extended with [custom fields](./f2-custom-fields.mdx), and can be grouped into [projects](./f3-projects.mdx).
 
-Tasks also appear inside [projects](./f3-projects.mdx) (F3). Optional [custom fields](./f2-custom-fields.mdx) (F2) extend tasks with due dates, notes, and more. [Inbox](./f4-inbox.mdx) items are not tasks until **marked ready** — until then, capture can land in the inbox instead of the task list.
+Items captured in the [inbox](./f4-inbox.mdx) become tasks when they are marked ready. [Views](./f5-views.mdx) arrange task lists, and [search](./f6-search.mdx) finds tasks by title.
 
 ## What users can do
 
@@ -23,10 +23,7 @@ Tasks also appear inside [projects](./f3-projects.mdx) (F3). Optional [custom fi
 - **Edit** a task's title.
 - **Mark complete** or **mark incomplete** via the completion control.
 - **Delete** a task (with confirmation).
-- **Filter completed tasks out** on the main task page — show incomplete only, or show all (including completed).
 - **Reorder** tasks by dragging and dropping (single task; order persisted).
-
-For project assignment and custom fields, see [F3 Projects](./f3-projects.mdx) and [F2 Custom fields](./f2-custom-fields.mdx).
 
 ### Multiple tasks (bulk)
 
@@ -51,12 +48,12 @@ Completion is a **built-in property** on every task — not a custom field.
 
 ### Completed tasks
 
-Completed tasks **stay in the list** — there is no archive step. They remain in place but can be hidden:
+Completed tasks **stay in the list** — there is no archive step.
 
 <!-- status: done -->
 
-- **Filter completed out** on the main task page to hide finished work (default: incomplete only, or user toggles to show all).
-- When shown, completed tasks are greyed out; when filtered out, they disappear from the list.
+- When visible, completed tasks are greyed out.
+- The active [view](./f5-views.mdx) controls whether incomplete, completed, or all tasks are shown.
 
 <!-- status: done -->
 
@@ -65,3 +62,4 @@ Completed tasks **stay in the list** — there is no archive step. They remain i
 - Manual drag order is remembered on the main task page (`sort_order` in the database).
 - Dragging one task reorders it; the list updates optimistically and persists via `reorder-tasks`.
 - When **multiple tasks are selected**, dragging any selected task moves **all of them** together.
+- Manual drag order applies only when [sorting](./f5-views.mdx) is **None**.
